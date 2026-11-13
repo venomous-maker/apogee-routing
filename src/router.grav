@@ -36,9 +36,10 @@ namespace apogee {
         public middleware: Array<string> = new Array<string>()
         public excluded: Array<string> = new Array<string>()
         public patterns: HashMap<string, string> = new HashMap<string, string>()
+        public scoped: bool = false
         fn copy() -> GroupAttrs {
             let g = new GroupAttrs();
-            g.prefix = self.prefix; g.namePrefix = self.namePrefix;
+            g.prefix = self.prefix; g.namePrefix = self.namePrefix; g.scoped = self.scoped;
             for (m in self.middleware) { g.middleware.push(m); }
             for (m in self.excluded) { g.excluded.push(m); }
             self.patterns.forEach(fn(k: string, v: string) { g.patterns.put(k, v); });
@@ -56,6 +57,8 @@ namespace apogee {
         fn middleware(names: Array<string>) -> RouteGroup { for (n in names) { self.attrs.middleware.push(n); } return self; }
         fn withoutMiddleware(names: Array<string>) -> RouteGroup { for (n in names) { self.attrs.excluded.push(n); } return self; }
         fn where(param: string, pattern: string) -> RouteGroup { self.attrs.patterns.put(param, pattern); return self; }
+        // Every route inside resolves its bound parameters through the one before.
+        fn scopeBindings() -> RouteGroup { self.attrs.scoped = true; return self; }
         fn group(body: fn(Router)) { self.router.withGroup(self.attrs, body); }
     }
 
@@ -72,6 +75,10 @@ namespace apogee {
         private groups: HashMap<string, Array<string>>
         private globalNames: Array<string>
         private binders: HashMap<string, fn(string, Request) -> any>
+        private keyedBinders: HashMap<string, fn(string, string, Request) -> any>
+        private childBinders: HashMap<string, fn(string, string, any, Request) -> any>
+        // Controller actions' implicit-binding plans, by "Class@action".
+        private actionPlans: HashMap<string, Array<string>>
         private patterns: HashMap<string, string>
         private fallbackRoute: RouteDef
         private ready: AtomicInt
@@ -89,6 +96,9 @@ namespace apogee {
             self.groups = new HashMap<string, Array<string>>();
             self.globalNames = new Array<string>();
             self.binders = new HashMap<string, fn(string, Request) -> any>();
+            self.keyedBinders = new HashMap<string, fn(string, string, Request) -> any>();
+            self.childBinders = new HashMap<string, fn(string, string, any, Request) -> any>();
+            self.actionPlans = new HashMap<string, Array<string>>();
             self.patterns = new HashMap<string, string>();
             self.fallbackRoute = null;
             self.ready = new AtomicInt(0);
@@ -132,14 +142,87 @@ namespace apogee {
         // (by class name: attribute routing and resources go through it)
         fn controllerNamed(key: string, action: string) -> fn(Request) -> Response {
             let root = self.container;
+            let me = self;
             return fn(req: Request) -> Response {
                 if (req.app == null) { req.app = root; }
                 let scope = req.scope();
                 let ctl = scope.makeNamed(key);
-                // (the Request, and form requests, come from the scope; route values fill the rest in order)
-                let out = scope.call(ctl, action, Router.routeValues(req));
+                // Services, the Request and form requests come from the scope; a
+                // model parameter takes its route value, bound (implicitly, through
+                // its class's resolveRouteBinding, when no binder did); the other
+                // parameters take the remaining route values as text, in order.
+                let plan = me.actionPlan(key, action);
+                let names = req.routeParamNames;
+                let values = Router.routeValues(req);
+                let extras = new Array<any>();
+                let vi = 0;
+                let routeDef = req.get("apogee.route");
+                let scoped = routeDef is RouteDef && (routeDef as RouteDef).scoped;
+                let parent: any = null;
+                for (kind in plan) {
+                    if (kind == "") { continue; }
+                    if (vi >= values.size()) { break; }
+                    let raw = names != null && vi < names.size() ? req.http.param(names[vi]) : str(values[vi]);
+                    if (kind == "value") { extras.push(raw); vi += 1; continue; }
+                    let cls = ClassInfo.forName(kind);
+                    let v = values[vi];
+                    if (!(ClassInfo.of(v) != null && ClassInfo.of(v).isSubclassOf(cls))) {
+                        let field = "";
+                        if (names != null && vi < names.size()) { field = me.bindingKeyOf(req, names[vi]); }
+                        let pc = parent == null ? null : ClassInfo.of(parent);
+                        let via = scoped && pc != null && pc.isReflected() ? pc.method("resolveChildRouteBinding") : null;
+                        let childName = names != null && vi < names.size() ? names[vi] : "";
+                        v = via != null ? via.invoke(parent, [childName as any, raw as any, field as any])
+                                        : cls.method("resolveRouteBinding").invoke(null, [raw as any, field as any]);
+                        if (v == null) {
+                            let r = req.get("apogee.route");
+                            if (r is RouteDef && (r as RouteDef).missingHandler != null) { return (r as RouteDef).missingHandler(req); }
+                            throw new HttpException(404);
+                        }
+                        if (names != null && vi < names.size()) { req.set(names[vi], v); }
+                    }
+                    scope.provideNamed(kind, v);
+                    parent = v;
+                    vi += 1;
+                }
+                for (j in vi..values.size()) { extras.push(values[j]); }
+                let out = scope.call(ctl, action, extras);
                 return Router.toResponse(out);
             };
+        }
+        // Per parameter of the action: "" for one the container fills, "value"
+        // for one taking a route value as text, or a model class's name (it
+        // has a static resolveRouteBinding(value, field)).
+        private fn actionPlan(key: string, action: string) -> Array<string> {
+            let id = key + "@" + action;
+            self.lock.lock();
+            let known = self.actionPlans.getOr(id, null);
+            self.lock.unlock();
+            if (known != null) { return known; }
+            let plan = new Array<string>();
+            let cls = ClassInfo.forName(key);
+            let m = cls == null ? null : cls.method(action);
+            if (m != null) {
+                for (t in Container.splitTypes(m.params)) {
+                    switch (t) {
+                        case "int", "long", "uint", "ulong", "float", "double", "bool", "string", "any", "string?": plan.push("value")
+                        default: {
+                            let pc = ClassInfo.forName(t);
+                            let finder = pc == null ? null : pc.method("resolveRouteBinding");
+                            plan.push(finder != null && finder.paramCount() == 2 ? pc.name : "");
+                        }
+                    }
+                }
+            }
+            self.lock.lock();
+            self.actionPlans.put(id, plan);
+            self.lock.unlock();
+            return plan;
+        }
+        // The binding key the matched route gives `param` ({post:slug} -> "slug").
+        private fn bindingKeyOf(req: Request, param: string) -> string {
+            let r = req.get("apogee.route");
+            return r is RouteDef ? (r as RouteDef).bindingKeys.getOr(param, "") : "";
         }
         // A handler's result as a Response: a Response, a JsonResource or
         // collection, a string (HTML), null (204), or anything else as JSON.
@@ -218,6 +301,7 @@ namespace apogee {
         fn name(n: string) -> RouteGroup { return new RouteGroup(self).name(n); }
         fn middleware(names: Array<string>) -> RouteGroup { return new RouteGroup(self).middleware(names); }
         fn group(body: fn(Router)) { new RouteGroup(self).group(body); }
+        fn scopeBindings() -> RouteGroup { return new RouteGroup(self).scopeBindings(); }
         // (RouteGroup.group's work: the attributes stack on the enclosing group's.)
         fn withGroup(attrs: GroupAttrs, body: fn(Router)) {
             let outer = self.stack[self.stack.size() - 1];
@@ -227,6 +311,7 @@ namespace apogee {
             for (m in attrs.middleware) { g.middleware.push(m); }
             for (m in attrs.excluded) { g.excluded.push(m); }
             attrs.patterns.forEach(fn(k: string, v: string) { g.patterns.put(k, v); });
+            if (attrs.scoped) { g.scoped = true; }
             self.stack.push(g);
             try { body(self); } finally { self.stack.pop(); }
         }
@@ -245,6 +330,7 @@ namespace apogee {
             for (m in g.middleware) { r.middlewareNames.push(m); }
             for (m in g.excluded) { r.excluded.push(m); }
             g.patterns.forEach(fn(k: string, v: string) { if (!r.constraints.containsKey(k)) { r.constraints.put(k, new Constraint(v)); } });
+            if (g.scoped) { r.scoped = true; }
             r.routeName = "";
             if (g.namePrefix != "") { r.routeName = g.namePrefix; }    // completed by name()
         }
@@ -271,6 +357,11 @@ namespace apogee {
         // `{param}` becomes what `resolve` gives (a model, say) as req.get(param);
         // a 404 when it gives null.
         fn bind(param: string, resolve: fn(string, Request) -> any) -> Router { self.binders.put(param, resolve); return self; }
+        // The same, told the binding key too: "slug" for {post:slug} ("" when none).
+        fn bindKeyed(param: string, resolve: fn(string, string, Request) -> any) -> Router { self.keyedBinders.put(param, resolve); return self; }
+        // In a scoped route, `{param}` found through the model bound before it
+        // (value, key, parent): a user's own post.
+        fn bindChild(param: string, resolve: fn(string, string, any, Request) -> any) -> Router { self.childBinders.put(param, resolve); return self; }
         // Every route's `{param}` must match `pattern` unless the route says otherwise.
         fn pattern(param: string, pattern: string) -> Router { self.patterns.put(param, pattern); self.dirty(); return self; }
 
@@ -456,23 +547,51 @@ namespace apogee {
         }
         private fn run(r: RouteDef, req: Request, m: RouteMatch) -> Response {
             req.routeName = r.routeName;
+            if (r.bindingKeys.size() > 0 || r.missingHandler != null || r.scoped) { req.set("apogee.route", r); }   // (for controllers' implicit binding)
             if (m != null) {
                 for (i, n in m.names) { req.http.setParam(n, m.values[i]); }
             }
             r.defaults.forEach(fn(k: string, v: string) { if (req.http.param(k) == "") { req.http.setParam(k, v); } });
             if (m != null && m.names.size() > 0) {
                 let values = new Array<any>();
+                let parent: any = null;
+                let anyBinders = self.binders.size() + self.keyedBinders.size() + self.childBinders.size() > 0;
                 for (n in m.names) {
-                    let bind = self.binders.size() > 0 ? self.binders.getOr(n, null) : null;
-                    if (bind == null) { values.push(req.http.param(n)); continue; }
-                    let found = bind(req.http.param(n), req);
-                    if (found == null) { throw new HttpException(404); }
+                    let raw = req.http.param(n);
+                    if (!anyBinders && !r.scoped) { values.push(raw); continue; }
+                    let key = r.bindingKeys.getOr(n, "");
+                    let found: any = null;
+                    let bound = false;
+                    if (r.scoped && parent != null) {
+                        let child = self.childBinders.getOr(n, null);
+                        if (child != null) { bound = true; found = child(raw, key, parent, req); }
+                        else {
+                            let pc = ClassInfo.of(parent);
+                            let via = pc != null && pc.isReflected() ? pc.method("resolveChildRouteBinding") : null;
+                            if (via != null && via.paramCount() == 3) { bound = true; found = via.invoke(parent, [n as any, raw as any, key as any]); }
+                        }
+                    }
+                    if (!bound) {
+                        let keyed = self.keyedBinders.getOr(n, null);
+                        let plain = self.binders.getOr(n, null);
+                        if (keyed != null) { bound = true; found = keyed(raw, key, req); }
+                        else if (plain != null) { bound = true; found = plain(raw, req); }
+                    }
+                    if (!bound) { values.push(raw); continue; }
+                    if (found == null) { return Router.missing(r, req); }
                     req.set(n, found);
                     values.push(found);
+                    parent = found;
                 }
                 req.routeValues = values;
+                req.routeParamNames = m.names;
             }
             return r.compiled(req);
+        }
+        // A binding found nothing: the route's missing() response, or a 404.
+        static fn missing(r: RouteDef, req: Request) -> Response {
+            if (r.missingHandler != null) { return r.missingHandler(req); }
+            throw new HttpException(404);
         }
         // The route values of the matched route, in its order (for controller
         // actions' parameters): bound models where bind() made one.
