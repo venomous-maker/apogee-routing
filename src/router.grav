@@ -1,0 +1,496 @@
+// router.grav — Router: routes in, a request's handler out.
+//
+//   let r = new Router(container)
+//   r.get("/", fn(req: Request) -> Response { return Response.text("home") }).name("home")
+//   r.get::<UserController>("/users/{id:int}", "show").name("users.show")
+//   r.prefix("admin").name("admin.").middleware(["auth"]).group(fn(r: Router) {
+//       r.resource::<PostController>("posts")            // index, create, store, show, edit, update, destroy
+//   })
+//   r.bind("post", fn(id: string, req: Request) -> any { return Post.find(id) })   // {post} -> a Post, or 404
+//   r.url("users.show", {"id": 7})                       // "/users/7"
+//   r.signedUrl("unsubscribe", {"user": 7}, Time.now() + 3600)
+//
+// Routes are compiled once, on the first request (or by compile()): fully
+// literal paths go into one hash table, the rest into a segment tree, and
+// each route's middleware is joined with its handler into one function. A
+// route added later just marks the router to compile again.
+import "std"
+import "std/net"
+import "apogee-container"
+import "apogee-http"
+import "route.grav"
+import "tree.grav"
+
+namespace apogee {
+
+    // Something that stands for itself in a URL by a key of its own (a model's id).
+    interface UrlRoutable {
+        fn routeKey() -> string
+    }
+
+    // What a group gives the routes declared inside it.
+    class GroupAttrs {
+        public prefix: string = ""
+        public namePrefix: string = ""
+        public middleware: Array<string> = new Array<string>()
+        public excluded: Array<string> = new Array<string>()
+        public patterns: HashMap<string, string> = new HashMap<string, string>()
+        fn copy() -> GroupAttrs {
+            let g = new GroupAttrs();
+            g.prefix = self.prefix; g.namePrefix = self.namePrefix;
+            for (m in self.middleware) { g.middleware.push(m); }
+            for (m in self.excluded) { g.excluded.push(m); }
+            self.patterns.forEach(fn(k: string, v: string) { g.patterns.put(k, v); });
+            return g;
+        }
+    }
+
+    // A group being described: r.prefix("api").middleware(["api"]).group(fn(r: Router) { ... }).
+    class RouteGroup {
+        private router: Router
+        private attrs: GroupAttrs
+        constructor(router: Router) { self.router = router; self.attrs = new GroupAttrs(); }
+        fn prefix(p: string) -> RouteGroup { self.attrs.prefix = RouteDef.normalize(self.attrs.prefix + "/" + p); return self; }
+        fn name(n: string) -> RouteGroup { self.attrs.namePrefix = self.attrs.namePrefix + n; return self; }
+        fn middleware(names: Array<string>) -> RouteGroup { for (n in names) { self.attrs.middleware.push(n); } return self; }
+        fn withoutMiddleware(names: Array<string>) -> RouteGroup { for (n in names) { self.attrs.excluded.push(n); } return self; }
+        fn where(param: string, pattern: string) -> RouteGroup { self.attrs.patterns.put(param, pattern); return self; }
+        fn group(body: fn(Router)) { self.router.withGroup(self.attrs, body); }
+    }
+
+    class Router {
+        public container: Container
+        // Signs URLs (signedUrl / signed routes); set it to the app key.
+        public signingKey: string = ""
+        private routes: Array<RouteDef>
+        private named: HashMap<string, RouteDef>
+        private staticTable: HashMap<string, HashMap<string, RouteDef>>
+        private tree: RouteTree
+        private stack: Array<GroupAttrs>
+        private aliases: HashMap<string, fn(Array<string>) -> Middleware>
+        private groups: HashMap<string, Array<string>>
+        private globalNames: Array<string>
+        private binders: HashMap<string, fn(string, Request) -> any>
+        private patterns: HashMap<string, string>
+        private fallbackRoute: RouteDef
+        private ready: AtomicInt
+        private lock: Mutex
+
+        constructor(container: Container) {
+            self.container = container;
+            self.routes = new Array<RouteDef>();
+            self.named = new HashMap<string, RouteDef>();
+            self.staticTable = new HashMap<string, HashMap<string, RouteDef>>();
+            self.tree = new RouteTree();
+            self.stack = new Array<GroupAttrs>();
+            self.stack.push(new GroupAttrs());
+            self.aliases = new HashMap<string, fn(Array<string>) -> Middleware>();
+            self.groups = new HashMap<string, Array<string>>();
+            self.globalNames = new Array<string>();
+            self.binders = new HashMap<string, fn(string, Request) -> any>();
+            self.patterns = new HashMap<string, string>();
+            self.fallbackRoute = null;
+            self.ready = new AtomicInt(0);
+            self.lock = new Mutex();
+        }
+
+        // ── routes ─────────────────────────────────────────────────────────────
+        fn get(uri: string, h: fn(Request) -> Response) -> RouteDef { return self.add(["GET"], uri, h); }
+        fn post(uri: string, h: fn(Request) -> Response) -> RouteDef { return self.add(["POST"], uri, h); }
+        fn put(uri: string, h: fn(Request) -> Response) -> RouteDef { return self.add(["PUT"], uri, h); }
+        fn patch(uri: string, h: fn(Request) -> Response) -> RouteDef { return self.add(["PATCH"], uri, h); }
+        fn delete(uri: string, h: fn(Request) -> Response) -> RouteDef { return self.add(["DELETE"], uri, h); }
+        fn options(uri: string, h: fn(Request) -> Response) -> RouteDef { return self.add(["OPTIONS"], uri, h); }
+        fn any(uri: string, h: fn(Request) -> Response) -> RouteDef { return self.add(["*"], uri, h); }
+        fn matching(methods: Array<string>, uri: string, h: fn(Request) -> Response) -> RouteDef {
+            let up = new Array<string>();
+            for (m in methods) { up.push(Str.upper(m)); }
+            return self.add(up, uri, h);
+        }
+        // A controller action: C (built from the request's container scope, its
+        // constructor injected) and its method `action`, called with its
+        // parameters resolved: services by type, the Request, then route values
+        // in order.
+        fn get<C>(uri: string, action: string) -> RouteDef { return self.add(["GET"], uri, self.controller::<C>(action)).describe(nameof(C) + "@" + action); }
+        fn post<C>(uri: string, action: string) -> RouteDef { return self.add(["POST"], uri, self.controller::<C>(action)).describe(nameof(C) + "@" + action); }
+        fn put<C>(uri: string, action: string) -> RouteDef { return self.add(["PUT"], uri, self.controller::<C>(action)).describe(nameof(C) + "@" + action); }
+        fn patch<C>(uri: string, action: string) -> RouteDef { return self.add(["PATCH"], uri, self.controller::<C>(action)).describe(nameof(C) + "@" + action); }
+        fn delete<C>(uri: string, action: string) -> RouteDef { return self.add(["DELETE"], uri, self.controller::<C>(action)).describe(nameof(C) + "@" + action); }
+        fn matching<C>(methods: Array<string>, uri: string, action: string) -> RouteDef { return self.matching(methods, uri, self.controller::<C>(action)).describe(nameof(C) + "@" + action); }
+        fn controller<C>(action: string) -> fn(Request) -> Response {
+            let key = nameof(C);
+            return self.controllerNamed(key, action);
+        }
+        // (by class name: attribute routing and resources go through it)
+        fn controllerNamed(key: string, action: string) -> fn(Request) -> Response {
+            let root = self.container;
+            return fn(req: Request) -> Response {
+                if (req.app == null) { req.app = root; }
+                let scope = req.scope();
+                let ctl = scope.makeNamed(key);
+                let extra = new Array<any>();
+                extra.push(req);
+                for (v in Router.routeValues(req)) { extra.push(v); }
+                let out = scope.call(ctl, action, extra);
+                return Router.toResponse(out);
+            };
+        }
+        // A handler's result as a Response: a Response, a JsonResource or
+        // collection, a string (HTML), null (204), or anything else as JSON.
+        static fn toResponse(out: any) -> Response {
+            if (out is Response) { return out as Response; }
+            if (out == null) { return Response.noContent(); }
+            if (out is string) { return Response.html(out as string); }
+            return Response.json(out);
+        }
+        // `from` answers with a redirect to `to`.
+        fn redirect(from: string, to: string, status: int = 302) -> RouteDef {
+            return self.any(from, fn(req: Request) -> Response { return Response.redirect(to, status); }).describe("redirect " + to);
+        }
+        // What answers when nothing else matched (instead of a 404).
+        fn fallback(h: fn(Request) -> Response) -> RouteDef {
+            let r = new RouteDef(["*"], "/", h, self);
+            r.describe("fallback");
+            self.applyGroup(r);
+            self.fallbackRoute = r;
+            self.dirty();
+            return r;
+        }
+
+        // The seven resource routes for controller C, those it has methods for
+        // (or only `only`, minus `except`): index, create, store, show, edit,
+        // update, destroy; named "<name>.<action>", the parameter named for the
+        // singular ("photos" -> {photo}).
+        fn resource<C>(name: string, only: Array<string> = new Array<string>(), except: Array<string> = new Array<string>()) -> Array<RouteDef> {
+            return self.resourceRoutes(nameof(C), reflect(C), name, only, except, false);
+        }
+        // The same, without create and edit (an API has no HTML forms).
+        fn apiResource<C>(name: string, only: Array<string> = new Array<string>(), except: Array<string> = new Array<string>()) -> Array<RouteDef> {
+            return self.resourceRoutes(nameof(C), reflect(C), name, only, except, true);
+        }
+        private fn resourceRoutes(key: string, cls: ClassInfo, name: string, only: Array<string>, except: Array<string>, api: bool) -> Array<RouteDef> {
+            let base = RouteDef.normalize(name);
+            let last = Str.split(name, "/");
+            let leaf = last[last.size() - 1];
+            let param = Router.singular(leaf);
+            let routeBase = Str.replace(base[1..], "/", ".");
+            let out = new Array<RouteDef>();
+            let actions = new Array<string>();
+            for (a in Str.split(api ? "index store show update destroy" : "index create store show edit update destroy", " ")) { actions.push(a); }
+            for (a in actions) {
+                if (only.size() > 0 && !only.contains(a)) { continue; }
+                if (except.contains(a)) { continue; }
+                if (cls.method(a) == null) { continue; }
+                let h = self.controllerNamed(key, a);
+                let r: RouteDef = null;
+                switch (a) {
+                    case "index": r = self.add(["GET"], base, h)
+                    case "create": r = self.add(["GET"], base + "/create", h)
+                    case "store": r = self.add(["POST"], base, h)
+                    case "show": r = self.add(["GET"], base + "/{" + param + "}", h)
+                    case "edit": r = self.add(["GET"], base + "/{" + param + "}/edit", h)
+                    case "update": r = self.add(["PUT", "PATCH"], base + "/{" + param + "}", h)
+                    default: r = self.add(["DELETE"], base + "/{" + param + "}", h)
+                }
+                r.describe(key + "@" + a).name(routeBase + "." + a);
+                out.push(r);
+            }
+            return out;
+        }
+        // "photos" -> "photo", "categories" -> "category", "boxes" -> "box".
+        static fn singular(word: string) -> string {
+            if (Str.endsWith(word, "ies") && word.length > 3) { return word[..word.length - 3] + "y"; }
+            if ((Str.endsWith(word, "ses") || Str.endsWith(word, "xes") || Str.endsWith(word, "ches") || Str.endsWith(word, "shes")) && word.length > 3) {
+                return word[..word.length - 2];
+            }
+            if (Str.endsWith(word, "s") && !Str.endsWith(word, "ss") && word.length > 1) { return word[..word.length - 1]; }
+            return word;
+        }
+
+        // ── groups ─────────────────────────────────────────────────────────────
+        fn prefix(p: string) -> RouteGroup { return new RouteGroup(self).prefix(p); }
+        fn name(n: string) -> RouteGroup { return new RouteGroup(self).name(n); }
+        fn middleware(names: Array<string>) -> RouteGroup { return new RouteGroup(self).middleware(names); }
+        fn group(body: fn(Router)) { new RouteGroup(self).group(body); }
+        // (RouteGroup.group's work: the attributes stack on the enclosing group's.)
+        fn withGroup(attrs: GroupAttrs, body: fn(Router)) {
+            let outer = self.stack[self.stack.size() - 1];
+            let g = outer.copy();
+            g.prefix = RouteDef.normalize(outer.prefix + "/" + attrs.prefix);
+            g.namePrefix = outer.namePrefix + attrs.namePrefix;
+            for (m in attrs.middleware) { g.middleware.push(m); }
+            for (m in attrs.excluded) { g.excluded.push(m); }
+            attrs.patterns.forEach(fn(k: string, v: string) { g.patterns.put(k, v); });
+            self.stack.push(g);
+            try { body(self); } finally { self.stack.pop(); }
+        }
+        private fn add(methods: Array<string>, uri: string, h: fn(Request) -> Response) -> RouteDef {
+            let g = self.stack[self.stack.size() - 1];
+            let r = new RouteDef(methods, g.prefix == "/" ? uri : g.prefix + "/" + uri, h, self);
+            self.applyGroup(r);
+            self.lock.lock();
+            self.routes.push(r);
+            self.lock.unlock();
+            self.dirty();
+            return r;
+        }
+        private fn applyGroup(r: RouteDef) {
+            let g = self.stack[self.stack.size() - 1];
+            for (m in g.middleware) { r.middlewareNames.push(m); }
+            for (m in g.excluded) { r.excluded.push(m); }
+            g.patterns.forEach(fn(k: string, v: string) { if (!r.constraints.containsKey(k)) { r.constraints.put(k, new Constraint(v)); } });
+            r.routeName = "";
+            if (g.namePrefix != "") { r.routeName = g.namePrefix; }    // completed by name()
+        }
+        // (RouteDef.name's work: the group's name prefix goes first.)
+        fn rename(r: RouteDef, old: string, n: string) {
+            let g = self.stack[self.stack.size() - 1];
+            let full = (old != "" && Str.endsWith(old, ".") ? old : g.namePrefix) + n;
+            self.lock.lock();
+            if (old != "" && self.named.getOr(old, null) == r) { self.named.remove(old); }
+            r.routeName = full;
+            self.named.put(full, r);
+            self.lock.unlock();
+        }
+
+        // ── middleware ─────────────────────────────────────────────────────────
+        // `name` (as routes write it, optionally with ":params") makes a middleware.
+        fn aliasMiddleware(name: string, make: fn(Array<string>) -> Middleware) -> Router { self.aliases.put(name, make); self.dirty(); return self; }
+        // A middleware that takes no parameters, as an alias.
+        fn aliasInstance(name: string, m: Middleware) -> Router { return self.aliasMiddleware(name, fn(args: Array<string>) -> Middleware { return m; }); }
+        // `name` stands for several ("web", "api").
+        fn middlewareGroup(name: string, names: Array<string>) -> Router { self.groups.put(name, names); self.dirty(); return self; }
+        // Runs on every route (outermost first, in the order added).
+        fn use(name: string) -> Router { self.globalNames.push(name); self.dirty(); return self; }
+        // `{param}` becomes what `resolve` gives (a model, say) as req.get(param);
+        // a 404 when it gives null.
+        fn bind(param: string, resolve: fn(string, Request) -> any) -> Router { self.binders.put(param, resolve); return self; }
+        // Every route's `{param}` must match `pattern` unless the route says otherwise.
+        fn pattern(param: string, pattern: string) -> Router { self.patterns.put(param, pattern); self.dirty(); return self; }
+
+        // ── URLs ───────────────────────────────────────────────────────────────
+        fn has(name: string) -> bool { return self.named.containsKey(name); }
+        fn route(name: string) -> RouteDef { return self.named.getOr(name, null); }
+        // The path of the route called `name` with `params` filled in; params it
+        // does not use go into the query string. ValueError for a missing one.
+        fn url(name: string, params: HashMap<string, any> = new HashMap<string, any>()) -> string {
+            let r = self.named.getOr(name, null);
+            if (r == null) { throw new ValueError("no route is called '" + name + "'"); }
+            let used = new HashSet<string>();
+            let sb = new StringBuilder();
+            for (s in r.segments) {
+                if (!s.isParam()) { sb.appendChar(47).append(s.literal); continue; }
+                let v = params.containsKey(s.param) ? params[s.param] : null;
+                if (v == null && r.defaults.containsKey(s.param)) { v = r.defaults[s.param]; }
+                if (v == null) {
+                    if (s.optional) { continue; }
+                    throw new ValueError("route '" + name + "' needs {" + s.param + "}");
+                }
+                used.add(s.param);
+                let text = Router.paramText(v);
+                sb.appendChar(47).append(s.rest ? text : Url.encode(text));
+            }
+            let path = sb.length() == 0 ? "/" : sb.toString();
+            let query = new Array<string>();
+            let extra = params.keys();
+            Sort.sort(extra);
+            for (k in extra) { if (!used.contains(k)) { query.push(Url.encode(k) + "=" + Url.encode(Router.paramText(params[k]))); } }
+            return query.size() == 0 ? path : path + "?" + Str.join(query, "&");
+        }
+        // A value as a URL parameter: a model's key (its `id` field), else its text.
+        static fn paramText(v: any) -> string {
+            if (v is string) { return v as string; }
+            if (v is UrlRoutable) { return (v as UrlRoutable).routeKey(); }
+            let info = ClassInfo.of(v);
+            if (info != null && info.isReflected()) {
+                let key = info.method("routeKey");
+                if (key != null && key.paramCount() == 0) { return str(key.invoke(v)); }
+                let id = info.field("id");
+                if (id != null && id.canGet()) { return str(id.get(v)); }
+            }
+            return str(v);
+        }
+        // url(name, params) with `expires` (unix seconds; 0: never) and a
+        // signature over both: a link that can be checked without storing it.
+        fn signedUrl(name: string, params: HashMap<string, any> = new HashMap<string, any>(), expires: long = 0) -> string {
+            if (self.signingKey == "") { throw new StateError("signed URLs need Router.signingKey (the app key)"); }
+            let p = new HashMap<string, any>();
+            params.forEach(fn(k: string, v: any) { p.put(k, v); });
+            if (expires > 0) { p.put("expires", expires); }
+            let unsigned = self.url(name, p);
+            let sep = Str.contains(unsigned, "?") ? "&" : "?";
+            return unsigned + sep + "signature=" + Hash.hmacSha256(self.signingKey, unsigned);
+        }
+        // Whether the request's URL carries a valid, unexpired signature.
+        fn hasValidSignature(req: Request) -> bool {
+            if (self.signingKey == "") { return false; }
+            let target = req.http.target;
+            let at = Str.indexOf(target, "signature=");
+            if (at < 1) { return false; }
+            let sig = target[at + 10..];
+            let amp = Str.indexOf(sig, "&");
+            if (amp >= 0) { return false; }                                  // signature must be last
+            let unsigned = target[..at - 1];
+            if (!Hash.equals(sig, Hash.hmacSha256(self.signingKey, unsigned))) { return false; }
+            let expires = Integer.parseOr(req.query("expires"), 0);
+            return expires == 0 || expires > Time.now();
+        }
+
+        // ── compiling ──────────────────────────────────────────────────────────
+        fn dirty() { self.ready.set(0); }
+        // Builds the lookup tables and joins every route's middleware (done on
+        // the first request if not before).
+        fn compile() {
+            self.lock.lock();
+            try {
+                if (self.ready.get() == 1) { return; }
+                let table = new HashMap<string, HashMap<string, RouteDef>>();
+                let tree = new RouteTree();
+                for (r in self.routes) {
+                    self.patterns.forEach(fn(k: string, v: string) { if (!r.constraints.containsKey(k)) { r.constraints.put(k, new Constraint(v)); } });
+                    r.compiled = self.join(r);
+                    if (r.paramNames().size() == 0) {
+                        let byMethod = table.getOr(r.uri, null);
+                        if (byMethod == null) { byMethod = new HashMap<string, RouteDef>(); table.put(r.uri, byMethod); }
+                        for (m in r.methods) {
+                            let old = byMethod.getOr(m, null);
+                            if (old != null) { throw new ValueError("two routes answer ${m} ${r.uri}: ${old.action} and ${r.action}"); }
+                            byMethod.put(m, r);
+                        }
+                    } else {
+                        tree.insert(r);
+                    }
+                }
+                if (self.fallbackRoute != null) { self.fallbackRoute.compiled = self.join(self.fallbackRoute); }
+                self.staticTable = table;
+                self.tree = tree;
+                self.ready.set(1);
+            } finally { self.lock.unlock(); }
+        }
+        private fn join(r: RouteDef) -> fn(Request) -> Response {
+            let names = new Array<string>();
+            for (n in self.globalNames) { names.push(n); }
+            for (n in r.middlewareNames) { names.push(n); }
+            let layers = new Array<Middleware>();
+            let seen = new HashSet<string>();
+            for (n in names) { self.expand(n, r.excluded, layers, seen, 0); }
+            let handler = r.handler;
+            if (r.mustBeSigned) {
+                let me = self;
+                let inner = handler;
+                handler = fn(req: Request) -> Response {
+                    if (!me.hasValidSignature(req)) { throw new HttpException(403, "Invalid signature."); }
+                    return inner(req);
+                };
+            }
+            return Pipeline.compose(layers, handler);
+        }
+        private fn expand(name: string, excluded: Array<string>, out: Array<Middleware>, seen: HashSet<string>, depth: int) {
+            if (depth > 16) { throw new ValueError("middleware groups nest too deeply at '" + name + "'"); }
+            let colon = Str.indexOf(name, ":");
+            let base = colon >= 0 ? name[..colon] : name;
+            if (excluded.contains(name) || excluded.contains(base)) { return; }
+            let grp = self.groups.getOr(name, null);
+            if (grp != null) { for (g in grp) { self.expand(g, excluded, out, seen, depth + 1); } return; }
+            if (seen.contains(name)) { return; }                               // each once, where it first appears
+            seen.add(name);
+            let args = new Array<string>();
+            if (colon >= 0) { for (a in Str.split(name[colon + 1..], ",")) { args.push(Str.trim(a)); } }
+            let make = self.aliases.getOr(base, null);
+            if (make != null) { out.push(make(args)); return; }
+            if (self.container != null && self.container.hasNamed(base)) {
+                let m = self.container.makeNamed(base);
+                if (m is Middleware) { out.push(m as Middleware); return; }
+            }
+            throw new ValueError("unknown middleware '" + base + "' (alias it with aliasMiddleware, or bind a Middleware class by that name)");
+        }
+
+        // ── dispatching ────────────────────────────────────────────────────────
+        // The response for `req`: its route's (with middleware), a 405 when the
+        // path exists for other methods, an automatic OPTIONS answer, the
+        // fallback, or a 404. Errors are left to the caller (HttpKernel renders them).
+        fn dispatch(req: Request) -> Response {
+            if (self.ready.get() != 1) { self.compile(); }
+            if (req.app == null) { req.app = self.container; }     // (its scope is made only if something asks)
+            let method = req.method();
+            let path = req.path();
+            if (path.length > 1 && Str.endsWith(path, "/")) { path = RouteDef.normalize(path); }
+            let allowed: Array<string> = null;
+            let byMethod = self.staticTable.getOr(path, null);
+            if (byMethod != null) {
+                let r = RouteTree.pick(byMethod, method);
+                if (r != null) { return self.run(r, req, null); }
+                allowed = new Array<string>();
+                RouteTree.collect(byMethod, allowed);
+            }
+            let m = self.tree.find(Router.segmentsOf(path), method);
+            if (m.route != null) { return self.run(m.route, req, m); }
+            if (allowed == null) { allowed = m.allowedMethods(); } else { for (a in m.allowedMethods()) { if (!allowed.contains(a)) { allowed.push(a); } } }
+            if (allowed.size() > 0) {
+                if (allowed.contains("GET") && !allowed.contains("HEAD")) { allowed.push("HEAD"); }
+                Sort.sort(allowed);
+                if (method == "OPTIONS") { return Response.noContent().header("Allow", Str.join(allowed, ", ")); }
+                throw new HttpException(405).withHeader("Allow", Str.join(allowed, ", "));
+            }
+            if (self.fallbackRoute != null) { return self.run(self.fallbackRoute, req, null); }
+            throw new HttpException(404);
+        }
+        // "/a/b/c" -> "a", "b", "c" (empty pieces skipped), in one pass.
+        static fn segmentsOf(path: string) -> Array<string> {
+            let out = new Array<string>();
+            let n = path.length;
+            let start = 0;
+            for (i in 0..(n + 1)) {
+                if (i == n || path[i] as int == 47) {
+                    if (i > start) { out.push(path[start..i]); }
+                    start = i + 1;
+                }
+            }
+            return out;
+        }
+        private fn run(r: RouteDef, req: Request, m: RouteMatch) -> Response {
+            req.routeName = r.routeName;
+            if (m != null) {
+                for (i, n in m.names) { req.http.setParam(n, m.values[i]); }
+            }
+            r.defaults.forEach(fn(k: string, v: string) { if (req.http.param(k) == "") { req.http.setParam(k, v); } });
+            if (m != null && m.names.size() > 0) {
+                let values = new Array<any>();
+                for (n in m.names) {
+                    let bind = self.binders.size() > 0 ? self.binders.getOr(n, null) : null;
+                    if (bind == null) { values.push(req.http.param(n)); continue; }
+                    let found = bind(req.http.param(n), req);
+                    if (found == null) { throw new HttpException(404); }
+                    req.set(n, found);
+                    values.push(found);
+                }
+                req.routeValues = values;
+            }
+            return r.compiled(req);
+        }
+        // The route values of the matched route, in its order (for controller
+        // actions' parameters): bound models where bind() made one.
+        static fn routeValues(req: Request) -> Array<any> { return req.routeValues == null ? new Array<any>() : req.routeValues; }
+
+        // Registers the routes declared with decorators on every Controller
+        // subclass (see controller.grav); how many.
+        fn discover() -> int { return RouteDiscovery.discover(self); }
+
+        // ── introspection ──────────────────────────────────────────────────────
+        fn all() -> Array<RouteDef> { return self.routes; }
+        // One line per route: methods, URI, name, action, middleware (route:list).
+        fn table() -> Array<Array<string>> {
+            let out = new Array<Array<string>>();
+            for (r in self.routes) {
+                let row = new Array<string>();
+                row.push(Str.join(r.methods, "|"));
+                row.push(r.uri);
+                row.push(r.routeName);
+                row.push(r.action);
+                row.push(Str.join(r.middlewareNames, ","));
+                out.push(row);
+            }
+            return out;
+        }
+    }
+}
