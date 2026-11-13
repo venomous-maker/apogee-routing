@@ -1,0 +1,98 @@
+// kernel.grav — HttpKernel: a request in, a response out, whatever happens
+// in between; and serving it on the standard library's HTTP server.
+//
+//   let kernel = new HttpKernel(router)
+//   kernel.report(fn(e: Exception, req: Request) { log.error(req.path(), e) })
+//   kernel.renderUsing("PaymentError", fn(e: Exception, req: Request) -> Response { ... })
+//   kernel.serve(8080)                                  // blocks; start(port) does not
+//
+// Exceptions become responses: a custom renderer for its kind, else one that
+// is Renderable (HttpException, a validation error) renders itself, else a 500:
+// reported first, and shown in full only with `debug` on.
+import "std"
+import "std/net"
+import "apogee-http"
+import "router.grav"
+
+namespace apogee {
+
+    class HttpKernel {
+        public router: Router
+        // Show an unexpected exception's message and trace in its 500 (never in production).
+        public debug: bool = false
+        private reporters: Array<fn(Exception, Request)>
+        private renderers: HashMap<string, fn(Exception, Request) -> Response>
+        private dontReport: HashSet<string>
+        private afterHooks: Array<fn(Request, Response)>
+
+        constructor(router: Router) {
+            self.router = router;
+            self.reporters = new Array<fn(Exception, Request)>();
+            self.renderers = new HashMap<string, fn(Exception, Request) -> Response>();
+            self.dontReport = new HashSet<string>();
+            self.dontReport.add("HttpException");
+            self.dontReport.add("ValidationException");
+            self.afterHooks = new Array<fn(Request, Response)>();
+        }
+
+        // `f` is told about every exception that becomes a 5xx, or of a kind not
+        // in dontReport (an HttpException 4xx is the client's problem).
+        fn report(f: fn(Exception, Request)) -> HttpKernel { self.reporters.push(f); return self; }
+        fn dontReportKind(kind: string) -> HttpKernel { self.dontReport.add(kind); return self; }
+        // Exceptions whose kind() is `kind` become `f`'s response.
+        fn renderUsing(kind: string, f: fn(Exception, Request) -> Response) -> HttpKernel { self.renderers.put(kind, f); return self; }
+        // Runs after every response is made (logging, metrics, terminable work).
+        fn after(f: fn(Request, Response)) -> HttpKernel { self.afterHooks.push(f); return self; }
+
+        fn handle(http: HttpRequest) -> HttpResponse { return self.handleRequest(new Request(http)).http; }
+        fn handleRequest(req: Request) -> Response {
+            let res: Response = null;
+            try { res = self.router.dispatch(req); }
+            catch (e: Exception) { res = self.renderException(e, req); }
+            for (h in self.afterHooks) {
+                try { h(req, res); } catch (e: Exception) { self.tell(e, req); }
+            }
+            req.endScope();
+            return res;
+        }
+        fn renderException(e: Exception, req: Request) -> Response {
+            let custom = self.renderers.getOr(e.kind(), null);
+            if (custom != null) { self.maybeReport(e, req, 0); return custom(e, req); }
+            if (e is Renderable) {
+                let r = (e as Renderable).render(req);
+                self.maybeReport(e, req, r.statusCode());
+                return r;
+            }
+            self.tell(e, req);
+            let message = self.debug ? e.kind() + ": " + e.message() : "Server Error";
+            if (req.expectsJson()) {
+                let body = new HashMap<string, any>();
+                body.put("message", message);
+                if (self.debug) { body.put("exception", e.kind()); body.put("trace", e.describe()); }
+                return Response.json(body, 500);
+            }
+            let page = HttpException.page(500, message);
+            if (self.debug) { page = Str.replace(page, "</main>", "<pre style=\"text-align:left;max-width:80ch;overflow:auto\">" + HttpException.escape(e.describe()) + "</pre></main>"); }
+            return Response.html(page, 500);
+        }
+        private fn maybeReport(e: Exception, req: Request, status: int) {
+            if (status >= 500 || !self.dontReport.contains(e.kind())) { self.tell(e, req); }
+        }
+        private fn tell(e: Exception, req: Request) {
+            for (f in self.reporters) { try { f(e, req); } catch (x: Exception) {} }
+        }
+
+        // ── serving ────────────────────────────────────────────────────────────
+        // A standard-library server sending every request through this kernel.
+        fn server() -> HttpServer {
+            let me = self;
+            let s = new HttpServer();
+            s.any("*", fn(h: HttpRequest) -> HttpResponse { return me.handle(h); });
+            return s;
+        }
+        // Serves on `port` (all interfaces), blocking.
+        fn serve(port: int, host: string = "*") { self.router.compile(); self.server().listen(host, port); }
+        // Serves on 127.0.0.1:`port` (0: any free port) in the background.
+        fn start(port: int = 0) -> HttpServer { self.router.compile(); return self.server().start(port); }
+    }
+}
