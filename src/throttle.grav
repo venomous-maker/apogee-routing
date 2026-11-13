@@ -1,0 +1,127 @@
+// throttle.grav — rate limiting: how many requests a client may make in a
+// window, as middleware ("throttle:60,1": 60 a minute) or by name
+// ("throttle:api", a limiter defined in code), with the X-RateLimit headers
+// and a 429 + Retry-After once used up.
+//
+//   let limits = new RateLimiter()
+//   limits.define("api", fn(req: Request) -> Limit {
+//       return req.user != null ? Limit.perMinute(600).by("user:${(req.user as User).id}") : Limit.perMinute(60)
+//   })
+//   router.aliasMiddleware("throttle", fn(args: Array<string>) -> Middleware { return new ThrottleRequests(limits, args) })
+import "std"
+import "apogee-http"
+
+namespace apogee {
+
+    // A limit: `max` hits per `seconds`, counted per key (the client's IP when
+    // none is given).
+    class Limit {
+        public max: int
+        public seconds: int
+        public key: string = ""
+        constructor(max: int, seconds: int) { self.max = max; self.seconds = seconds < 1 ? 1 : seconds; }
+        static fn perSecond(n: int) -> Limit { return new Limit(n, 1); }
+        static fn perMinute(n: int) -> Limit { return new Limit(n, 60); }
+        static fn perHour(n: int) -> Limit { return new Limit(n, 3600); }
+        static fn perDay(n: int) -> Limit { return new Limit(n, 86400); }
+        static fn none() -> Limit { return new Limit(0, 1); }
+        fn by(key: string) -> Limit { self.key = key; return self; }
+        fn unlimited() -> bool { return self.max <= 0; }
+    }
+
+    class Window {
+        public start: long
+        public hits: int
+        constructor(start: long) { self.start = start; self.hits = 0; }
+    }
+
+    // Counts hits per key in fixed windows, in memory (one process). Old
+    // windows are dropped as it goes, so memory stays bounded by active keys.
+    class RateLimiter {
+        private windows: HashMap<string, Window>
+        private named: HashMap<string, fn(Request) -> Limit>
+        private lock: Mutex
+        private sweeps: int
+        constructor() {
+            self.windows = new HashMap<string, Window>();
+            self.named = new HashMap<string, fn(Request) -> Limit>();
+            self.lock = new Mutex();
+            self.sweeps = 0;
+        }
+        fn define(name: string, f: fn(Request) -> Limit) -> RateLimiter { self.named.put(name, f); return self; }
+        fn limiter(name: string) -> fn(Request) -> Limit { return self.named.getOr(name, null); }
+
+        // Records a hit for `key`; whether it is within `max` per `seconds`.
+        fn hit(key: string, max: int, seconds: int) -> bool { return self.attempt(key, max, seconds) >= 0; }
+        // Records a hit; the hits left in this window, or -1 when over the limit.
+        fn attempt(key: string, max: int, seconds: int) -> int {
+            let now = Time.monotonicMs();
+            self.lock.lock();
+            let w = self.windows.getOr(key, null);
+            if (w == null || now - w.start >= (seconds as long) * 1000) {
+                w = new Window(now);
+                self.windows.put(key, w);
+                self.sweeps += 1;
+                if (self.sweeps >= 1024) { self.sweep(now); }
+            }
+            w.hits += 1;
+            let left = w.hits <= max ? max - w.hits : -1;
+            self.lock.unlock();
+            return left;
+        }
+        // Seconds until `key`'s window resets.
+        fn availableIn(key: string, seconds: int) -> int {
+            self.lock.lock();
+            let w = self.windows.getOr(key, null);
+            let left = 0;
+            if (w != null) {
+                let ms = (seconds as long) * 1000 - (Time.monotonicMs() - w.start);
+                left = ms <= 0 ? 0 : ((ms + 999) / 1000) as int;
+            }
+            self.lock.unlock();
+            return left;
+        }
+        fn clear(key: string) { self.lock.lock(); self.windows.remove(key); self.lock.unlock(); }
+        // (under the lock: drops windows older than a day's worth, and any expired one)
+        private fn sweep(now: long) {
+            self.sweeps = 0;
+            let old = new Array<string>();
+            self.windows.forEach(fn(k: string, w: Window) { if (now - w.start > 3600000) { old.push(k); } });
+            for (k in old) { self.windows.remove(k); }
+        }
+    }
+
+    // The middleware: args are [max, minutes] or [limiterName].
+    class ThrottleRequests implements Middleware {
+        private limits: RateLimiter
+        private fixed: Limit
+        private named: fn(Request) -> Limit
+        private label: string
+        constructor(limits: RateLimiter, args: Array<string>) {
+            self.limits = limits;
+            self.fixed = null;
+            self.named = null;
+            self.label = Str.join(args, ",");
+            if (args.size() >= 1 && Format.toIntOr(args[0], -1) < 0) {
+                self.named = limits.limiter(args[0]);
+                if (self.named == null) { throw new ValueError("no rate limiter called '" + args[0] + "'"); }
+            } else {
+                let max = args.size() >= 1 ? Format.toIntOr(args[0], 60) : 60;
+                let minutes = args.size() >= 2 ? Format.toIntOr(args[1], 1) : 1;
+                self.fixed = new Limit(max, minutes * 60);
+            }
+        }
+        fn handle(req: Request, next: fn(Request) -> Response) -> Response {
+            let limit = self.named != null ? self.named(req) : self.fixed;
+            if (limit.unlimited()) { return next(req); }
+            let who = limit.key != "" ? limit.key : req.ip();
+            let key = "throttle|" + self.label + "|" + (req.routeName != "" ? req.routeName : req.path()) + "|" + who;
+            let left = self.limits.attempt(key, limit.max, limit.seconds);
+            if (left < 0) {
+                let wait = self.limits.availableIn(key, limit.seconds);
+                throw new HttpException(429).withHeader("Retry-After", "${wait}").withHeader("X-RateLimit-Limit", "${limit.max}").withHeader("X-RateLimit-Remaining", "0");
+            }
+            return next(req).header("X-RateLimit-Limit", "${limit.max}").header("X-RateLimit-Remaining", "${left}");
+        }
+    }
+}
