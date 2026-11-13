@@ -27,7 +27,7 @@ test "matching: literal paths, parameters, constraints, optional and rest, backt
     r.get("/users", ok("list"))
     r.get("/users/new", ok("new form"))                              // a literal wins over {id}
     r.get("/users/{id:int}", fn(req: Request) -> Response { return echoParams(req) })
-    r.get("/users/{slug:slug}", fn(req: Request) -> Response { return echoParams(req) })
+    r.get("/users/{slug}", fn(req: Request) -> Response { return echoParams(req) }).where("slug", "slug")
     r.get("/posts/{page?}", fn(req: Request) -> Response { return echoParams(req) }).defaultValue("page", "1")
     r.get("/files/{path*}", fn(req: Request) -> Response { return echoParams(req) })
     r.get("/codes/{code:[A-Z]{3}}", fn(req: Request) -> Response { return echoParams(req) })
@@ -261,4 +261,72 @@ test "serving: a real request through the standard library's server" {
     let res = HttpClient.fetch(server.baseUrl() + "/hello/ada")
     assertEq("${res.status} ${res.body()}", "200 {\"hi\":\"ada\"}")
     server.stop()
+}
+
+// A model the router can find by itself (implicit binding), and its children (scoped).
+@Model class Author {
+    public id: long  public slug: string
+    constructor(id: long, slug: string) { self.id = id; self.slug = slug }
+    static fn resolveRouteBinding(value: string, field: string) -> any {
+        for (a in Library.authors) { if ((field == "slug" && a.slug == value) || (field == "" && "${a.id}" == value)) { return a } }
+        return null
+    }
+    fn resolveChildRouteBinding(child: string, value: string, field: string) -> any {
+        for (b in Library.books) { if (b.authorId == self.id && "${b.id}" == value) { return b } }
+        return null
+    }
+}
+@Model class Book {
+    public id: long  public authorId: long  public title: string
+    constructor(id: long, authorId: long, title: string) { self.id = id; self.authorId = authorId; self.title = title }
+    static fn resolveRouteBinding(value: string, field: string) -> any {
+        for (b in Library.books) { if ("${b.id}" == value) { return b } }
+        return null
+    }
+}
+class Library {
+    public static authors: Array<Author> = new Array<Author>()
+    public static books: Array<Book> = new Array<Book>()
+    static fn seed() {
+        if (Library.authors.size() > 0) { return }
+        Library.authors.push(new Author(1, "ada")); Library.authors.push(new Author(2, "grace"))
+        Library.books.push(new Book(10, 1, "Notes")); Library.books.push(new Book(20, 2, "Compilers"))
+    }
+}
+class AuthorController extends Controller {
+    constructor() {}
+    fn show(req: Request, author: Author) -> Response { return Response.text("author ${author.id} ${author.slug}") }
+    fn book(author: Author, book: Book, format: string) -> Response { return Response.text("${author.slug}: ${book.title} as ${format}") }
+}
+
+test "route binding: implicit by parameter type, custom keys, scoped children, missing()" {
+    Library.seed()
+    let r = new Router(new Container())
+    r.get::<AuthorController>("/authors/{author}", "show")
+    r.get::<AuthorController>("/by-slug/{author:slug}", "show")
+    r.get::<AuthorController>("/authors/{author}/books/{book}.{format}", "book")
+    r.get::<AuthorController>("/a/{author}/b/{book}/{format}", "book").scopeBindings()
+    r.get::<AuthorController>("/soft/{author}", "show").missing(fn(req: Request) -> Response { return Response.redirect("/authors") })
+    let k = new HttpKernel(r)
+    assertEq(call(k, "GET", "/authors/2").body(), "author 2 grace")                 // implicit: Author.resolveRouteBinding
+    assertEq(call(k, "GET", "/by-slug/ada").body(), "author 1 ada")                 // {author:slug}
+    assertEq(call(k, "GET", "/authors/9").statusCode(), 404)
+    assertEq(call(k, "GET", "/a/1/b/10/pdf").body(), "ada: Notes as pdf")            // scoped: Ada's own book
+    assertEq(call(k, "GET", "/a/1/b/20/pdf").statusCode(), 404)                      // Grace's book, not Ada's
+    assertEq(call(k, "GET", "/soft/9").getHeader("Location"), "/authors")            // missing()
+
+    // Explicit binders, keyed and child, on closure routes.
+    let r2 = new Router(new Container())
+    r2.bindKeyed("author", fn(value: string, key: string, req: Request) -> any { return Author.resolveRouteBinding(value, key) })
+    r2.bindChild("book", fn(value: string, key: string, parent: any, req: Request) -> any {
+        let a = parent as Author
+        for (b in Library.books) { if (b.authorId == a.id && "${b.id}" == value) { return b } }
+        return null
+    })
+    r2.scopeBindings().group(fn(r: Router) {
+        r.get("/w/{author:slug}/books/{book}", fn(req: Request) -> Response { return Response.text((req.route("book") as Book).title) })
+    })
+    let k2 = new HttpKernel(r2)
+    assertEq(call(k2, "GET", "/w/grace/books/20").body(), "Compilers")
+    assertEq(call(k2, "GET", "/w/grace/books/10").statusCode(), 404)
 }
