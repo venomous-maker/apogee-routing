@@ -129,10 +129,8 @@ namespace apogee {
                 if (req.app == null) { req.app = root; }
                 let scope = req.scope();
                 let ctl = scope.makeNamed(key);
-                let extra = new Array<any>();
-                extra.push(req);
-                for (v in Router.routeValues(req)) { extra.push(v); }
-                let out = scope.call(ctl, action, extra);
+                // (the Request, and form requests, come from the scope; route values fill the rest in order)
+                let out = scope.call(ctl, action, Router.routeValues(req));
                 return Router.toResponse(out);
             };
         }
