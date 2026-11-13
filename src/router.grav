@@ -103,6 +103,8 @@ namespace apogee {
         fn delete(uri: string, h: fn(Request) -> Response) -> RouteDef { return self.add(["DELETE"], uri, h); }
         fn options(uri: string, h: fn(Request) -> Response) -> RouteDef { return self.add(["OPTIONS"], uri, h); }
         fn any(uri: string, h: fn(Request) -> Response) -> RouteDef { return self.add(["*"], uri, h); }
+        // Laravel's name; matching() is the same.
+        fn match(methods: Array<string>, uri: string, h: fn(Request) -> Response) -> RouteDef { return self.matching(methods, uri, h); }
         fn matching(methods: Array<string>, uri: string, h: fn(Request) -> Response) -> RouteDef {
             let up = new Array<string>();
             for (m in methods) { up.push(Str.upper(m)); }
