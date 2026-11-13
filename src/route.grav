@@ -1,0 +1,176 @@
+// route.grav — RouteDef: one route as registered (methods, URI pattern,
+// handler, name, middleware, constraints), parsed into segments once.
+//
+// URI patterns: "/users/{id}", "{id:int}" (or .whereNumber("id")), "{slug:slug}",
+// "{code:[A-Z]{3}}" (a regular expression), "{page?}" (optional: the route
+// also answers without it), "{path*}" (the rest of the path, slashes included).
+// Constraint shorthands: int, alpha, alnum, slug, uuid, ulid, hex, any.
+import "std"
+import "apogee-http"
+
+namespace apogee {
+
+    // One "{...}" or literal segment of a pattern.
+    class Segment {
+        public literal: string
+        public param: string
+        public optional: bool
+        public rest: bool
+        constructor(literal: string, param: string, optional: bool, rest: bool) {
+            self.literal = literal; self.param = param; self.optional = optional; self.rest = rest;
+        }
+        fn isParam() -> bool { return self.param != ""; }
+    }
+
+    // A parameter's constraint: a shorthand checked by hand, or a regex.
+    class Constraint {
+        public kind: int                 // 0 any, 1 int, 2 alpha, 3 alnum, 4 slug, 5 uuid, 6 ulid, 7 hex, 8 regex, 9 one of
+        public re: Regex
+        public allowed: HashSet<string>
+        public text: string
+        constructor(text: string) {
+            self.text = text; self.re = null; self.allowed = null;
+            switch (text) {
+                case "", "any": self.kind = 0
+                case "int", "number", "[0-9]+": self.kind = 1
+                case "alpha", "[a-zA-Z]+": self.kind = 2
+                case "alnum", "[a-zA-Z0-9]+": self.kind = 3
+                case "slug": self.kind = 4
+                case "uuid": self.kind = 5
+                case "ulid": self.kind = 6
+                case "hex": self.kind = 7
+                default: { self.kind = 8; self.re = new Regex("^(" + text + ")$"); }
+            }
+        }
+        static fn oneOf(values: Array<string>) -> Constraint {
+            let c = new Constraint("any");
+            c.kind = 9;
+            c.text = Str.join(values, "|");
+            c.allowed = new HashSet<string>();
+            for (v in values) { c.allowed.add(v); }
+            return c;
+        }
+        fn accepts(s: string) -> bool {
+            let n = s.length;
+            if (self.kind == 0) { return n > 0; }
+            if (self.kind == 8) { return self.re.test(s); }
+            if (self.kind == 9) { return self.allowed.contains(s); }
+            if (n == 0) { return false; }
+            if (self.kind == 5) { return Uuid.isValid(s); }
+            if (self.kind == 6 && n != 26) { return false; }
+            for (i in 0..n) {
+                let c = s[i] as int;
+                let digit = c >= 48 && c <= 57;
+                let lower = c >= 97 && c <= 122;
+                let upper = c >= 65 && c <= 90;
+                let ok = false;
+                switch (self.kind) {
+                    case 1: ok = digit
+                    case 2: ok = lower || upper
+                    case 3: ok = digit || lower || upper
+                    case 4: ok = digit || lower || c == 45 || c == 95
+                    case 6: ok = digit || upper
+                    case 7: ok = digit || (c >= 97 && c <= 102) || (c >= 65 && c <= 70)
+                    default: ok = true
+                }
+                if (!ok) { return false; }
+            }
+            return true;
+        }
+    }
+
+    class RouteDef {
+        public methods: Array<string>
+        public uri: string
+        public handler: fn(Request) -> Response
+        // What it runs, for route:list ("UserController@show", "closure").
+        public action: string
+        public routeName: string
+        // Middleware names as given ("auth", "throttle:60,1", a group name).
+        public middlewareNames: Array<string>
+        public excluded: Array<string>
+        public constraints: HashMap<string, Constraint>
+        public defaults: HashMap<string, string>
+        public segments: Array<Segment>
+        // The handler with its middleware, joined when routes are compiled.
+        public compiled: fn(Request) -> Response
+        // Which router owns it (so name() can index it).
+        public owner: Router
+        // A signed URL is required ("signed" middleware, on by .signed()).
+        public mustBeSigned: bool
+
+        constructor(methods: Array<string>, uri: string, handler: fn(Request) -> Response, owner: Router) {
+            self.methods = methods;
+            self.uri = RouteDef.normalize(uri);
+            self.handler = handler;
+            self.action = "closure";
+            self.routeName = "";
+            self.middlewareNames = new Array<string>();
+            self.excluded = new Array<string>();
+            self.constraints = new HashMap<string, Constraint>();
+            self.defaults = new HashMap<string, string>();
+            self.compiled = null;
+            self.owner = owner;
+            self.mustBeSigned = false;
+            self.segments = RouteDef.parse(self.uri, self.constraints);
+        }
+
+        // ── fluent configuration ───────────────────────────────────────────────
+        fn name(n: string) -> RouteDef { self.owner.rename(self, self.routeName, n); return self; }
+        fn middleware(names: Array<string>) -> RouteDef { for (n in names) { self.middlewareNames.push(n); } self.owner.dirty(); return self; }
+        fn withoutMiddleware(names: Array<string>) -> RouteDef { for (n in names) { self.excluded.push(n); } self.owner.dirty(); return self; }
+        // Constrains `param` to match `pattern` (a shorthand or a regex).
+        fn where(param: string, pattern: string) -> RouteDef { self.constraints.put(param, new Constraint(pattern)); self.owner.dirty(); return self; }
+        fn whereNumber(param: string) -> RouteDef { return self.where(param, "int"); }
+        fn whereAlpha(param: string) -> RouteDef { return self.where(param, "alpha"); }
+        fn whereAlphaNumeric(param: string) -> RouteDef { return self.where(param, "alnum"); }
+        fn whereUuid(param: string) -> RouteDef { return self.where(param, "uuid"); }
+        fn whereIn(param: string, values: Array<string>) -> RouteDef { self.constraints.put(param, Constraint.oneOf(values)); self.owner.dirty(); return self; }
+        // A value for an optional parameter left out.
+        fn defaultValue(param: string, value: string) -> RouteDef { self.defaults.put(param, value); return self; }
+        // Only a valid signed URL may reach it (see Router.signedUrl).
+        fn signed() -> RouteDef { self.mustBeSigned = true; self.owner.dirty(); return self; }
+        fn describe(text: string) -> RouteDef { self.action = text; return self; }
+
+        // Its parameters' names, in order.
+        fn paramNames() -> Array<string> {
+            let out = new Array<string>();
+            for (s in self.segments) { if (s.isParam()) { out.push(s.param); } }
+            return out;
+        }
+
+        // ── parsing ────────────────────────────────────────────────────────────
+        // "/a//b/" -> "/a/b"; "" -> "/".
+        static fn normalize(uri: string) -> string {
+            let out = new StringBuilder();
+            for (p in Str.split(uri, "/")) { if (p != "") { out.appendChar(47).append(p); } }
+            return out.length() == 0 ? "/" : out.toString();
+        }
+        static fn parse(uri: string, constraints: HashMap<string, Constraint>) -> Array<Segment> {
+            let out = new Array<Segment>();
+            for (p in Str.split(uri, "/")) {
+                if (p == "") { continue; }
+                if (!Str.startsWith(p, "{") || !Str.endsWith(p, "}")) {
+                    if (Str.contains(p, "{")) { throw new ValueError("a route parameter must be a whole segment: '" + p + "' in " + uri); }
+                    out.push(new Segment(p, "", false, false));
+                    continue;
+                }
+                let inner = p[1..p.length - 1];
+                let colon = Str.indexOf(inner, ":");
+                let pattern = "";
+                if (colon >= 0) { pattern = inner[colon + 1..]; inner = inner[..colon]; }
+                let optional = Str.endsWith(inner, "?");
+                let rest = Str.endsWith(inner, "*");
+                if (optional || rest) { inner = inner[..inner.length - 1]; }
+                if (inner == "") { throw new ValueError("an unnamed route parameter in " + uri); }
+                if (pattern != "") { constraints.put(inner, new Constraint(pattern)); }
+                out.push(new Segment("", inner, optional, rest));
+            }
+            for (i, s in out) {
+                if (s.rest && i != out.size() - 1) { throw new ValueError("{" + s.param + "*} must be the last segment of " + uri); }
+                if (s.optional && i != out.size() - 1 && !out[i + 1].optional) { throw new ValueError("only trailing parameters can be optional in " + uri); }
+            }
+            return out;
+        }
+    }
+}
