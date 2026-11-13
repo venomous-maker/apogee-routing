@@ -1,0 +1,168 @@
+// tree.grav — RouteTree: the routes with parameters, as a tree of path
+// segments. Matching walks one level per segment: a literal child (a hash
+// lookup) first, then parameter edges (constrained ones before open ones),
+// then a rest-of-path edge, backing out of a branch that leads nowhere. Routes
+// without parameters never reach it: the router answers them from one hash
+// table keyed by path.
+import "std"
+import "apogee-http"
+import "route.grav"
+
+namespace apogee {
+
+    class ParamEdge {
+        public name: string
+        public constraint: Constraint
+        public node: RouteNode
+        constructor(name: string, constraint: Constraint) { self.name = name; self.constraint = constraint; self.node = new RouteNode(); }
+    }
+
+    class RouteNode {
+        public statics: HashMap<string, RouteNode>
+        public params: Array<ParamEdge>
+        // Routes ending here, by method ("*" for any).
+        public routes: HashMap<string, RouteDef>
+        // A rest-of-path parameter ending here: its name, constraint and routes.
+        public restName: string
+        public restConstraint: Constraint
+        public restRoutes: HashMap<string, RouteDef>
+        constructor() {
+            self.statics = null; self.params = null; self.routes = null;
+            self.restName = ""; self.restConstraint = null; self.restRoutes = null;
+        }
+        fn child(literal: string) -> RouteNode {
+            if (self.statics == null) { self.statics = new HashMap<string, RouteNode>(); }
+            let n = self.statics.getOr(literal, null);
+            if (n == null) { n = new RouteNode(); self.statics.put(literal, n); }
+            return n;
+        }
+        fn paramChild(name: string, c: Constraint) -> RouteNode {
+            if (self.params == null) { self.params = new Array<ParamEdge>(); }
+            let key = c == null ? "" : c.text;
+            for (e in self.params) {
+                let k = e.constraint == null ? "" : e.constraint.text;
+                if (k == key) {
+                    if (e.name != name) { throw new ValueError("two routes name the same parameter differently here: {" + e.name + "} and {" + name + "}"); }
+                    return e.node;
+                }
+            }
+            let edge = new ParamEdge(name, c);
+            self.params.push(edge);
+            // Constrained edges are tried before an open one.
+            self.params.sortBy(fn(a: ParamEdge, b: ParamEdge) -> int {
+                let ca = a.constraint == null || a.constraint.kind == 0 ? 1 : 0;
+                let cb = b.constraint == null || b.constraint.kind == 0 ? 1 : 0;
+                return ca - cb;
+            });
+            return edge.node;
+        }
+        fn add(method: string, r: RouteDef) {
+            if (self.routes == null) { self.routes = new HashMap<string, RouteDef>(); }
+            RouteNode.put(self.routes, method, r);
+        }
+        fn addRest(name: string, c: Constraint, method: string, r: RouteDef) {
+            if (self.restRoutes == null) { self.restRoutes = new HashMap<string, RouteDef>(); self.restName = name; self.restConstraint = c; }
+            RouteNode.put(self.restRoutes, method, r);
+        }
+        private static fn put(m: HashMap<string, RouteDef>, method: string, r: RouteDef) {
+            let old = m.getOr(method, null);
+            if (old != null && old != r) { throw new ValueError("two routes answer ${method} ${r.uri}: ${old.action} and ${r.action}"); }
+            m.put(method, r);
+        }
+    }
+
+    // What a match found: the route, and its parameters' values in order.
+    class RouteMatch {
+        public route: RouteDef
+        public names: Array<string>
+        public values: Array<string>
+        // When nothing matched the method but a route matched the path: the
+        // methods that would have (for 405 and OPTIONS).
+        public allowed: Array<string>
+        constructor() { self.route = null; self.names = new Array<string>(); self.values = new Array<string>(); self.allowed = null; }
+        fn allow(routes: HashMap<string, RouteDef>) {
+            if (self.allowed == null) { self.allowed = new Array<string>(); }
+            RouteTree.collect(routes, self.allowed);
+        }
+        fn allowedMethods() -> Array<string> { return self.allowed == null ? new Array<string>() : self.allowed; }
+    }
+
+    class RouteTree {
+        public root: RouteNode
+        constructor() { self.root = new RouteNode(); }
+
+        fn insert(r: RouteDef) {
+            // A route with optional trailing parameters is also reachable without them.
+            let required = 0;
+            for (s in r.segments) { if (!s.optional) { required += 1; } }
+            let n = r.segments.size();
+            for (len in required..(n + 1)) { self.insertPrefix(r, len); }
+        }
+        private fn insertPrefix(r: RouteDef, len: int) {
+            let node = self.root;
+            for (i in 0..len) {
+                let s = r.segments[i];
+                if (s.rest) {
+                    for (m in r.methods) { node.addRest(s.param, r.constraints.getOr(s.param, null), m, r); }
+                    return;
+                }
+                node = s.isParam() ? node.paramChild(s.param, r.constraints.getOr(s.param, null)) : node.child(s.literal);
+            }
+            for (m in r.methods) { node.add(m, r); }
+        }
+
+        fn find(segs: Array<string>, method: string) -> RouteMatch {
+            let m = new RouteMatch();
+            m.route = self.walk(self.root, segs, 0, method, m);
+            return m;
+        }
+        private fn walk(node: RouteNode, segs: Array<string>, i: int, method: string, m: RouteMatch) -> RouteDef {
+            if (i == segs.size()) {
+                if (node.routes != null) {
+                    let r = RouteTree.pick(node.routes, method);
+                    if (r != null) { return r; }
+                    m.allow(node.routes);
+                }
+                return null;
+            }
+            let seg = segs[i];
+            if (node.statics != null) {
+                let next = node.statics.getOr(seg, null);
+                if (next != null) {
+                    let r = self.walk(next, segs, i + 1, method, m);
+                    if (r != null) { return r; }
+                }
+            }
+            if (node.params != null) {
+                for (e in node.params) {
+                    if (e.constraint != null && !e.constraint.accepts(seg)) { continue; }
+                    m.names.push(e.name);
+                    m.values.push(seg);
+                    let r = self.walk(e.node, segs, i + 1, method, m);
+                    if (r != null) { return r; }
+                    m.names.pop();
+                    m.values.pop();
+                }
+            }
+            if (node.restRoutes != null) {
+                let rest = Str.join(segs.slice(i, segs.size()), "/");
+                if (node.restConstraint == null || node.restConstraint.accepts(rest)) {
+                    let r = RouteTree.pick(node.restRoutes, method);
+                    if (r != null) { m.names.push(node.restName); m.values.push(rest); return r; }
+                    m.allow(node.restRoutes);
+                }
+            }
+            return null;
+        }
+        // The route for `method`: its own, a GET's for HEAD, or an any-method one.
+        static fn pick(routes: HashMap<string, RouteDef>, method: string) -> RouteDef {
+            let r = routes.getOr(method, null);
+            if (r == null && method == "HEAD") { r = routes.getOr("GET", null); }
+            if (r == null) { r = routes.getOr("*", null); }
+            return r;
+        }
+        static fn collect(routes: HashMap<string, RouteDef>, into: Array<string>) {
+            routes.forEach(fn(k: string, r: RouteDef) { if (!into.contains(k)) { into.push(k); } });
+        }
+    }
+}
