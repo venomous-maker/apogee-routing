@@ -1,0 +1,264 @@
+// apogee-routing's tests: matching (literal, parameters, constraints,
+// optional and rest parameters, backtracking), 405/OPTIONS/HEAD, groups,
+// names and URLs, signed URLs, model binding, controllers with injection,
+// resource routes, decorator routes, middleware (aliases, groups,
+// parameters, exclusion), throttling, the kernel's error rendering, and a
+// real server round trip.
+import "std"
+import "std/net"
+import "../src/all.grav"
+use apogee.*
+
+fn ok(text: string) -> fn(Request) -> Response { return fn(req: Request) -> Response { return Response.text(text) } }
+fn echoParams(req: Request) -> Response {
+    let keys = new Array<string>()
+    for (k in ["id", "slug", "page", "path", "code", "post"]) { if (req.param(k) != "") { keys.push(k + "=" + req.param(k)) } }
+    return Response.text(Str.join(keys, ","))
+}
+fn call(k: HttpKernel, method: string, target: string) -> Response {
+    let r = Request.make(method, target)
+    r.http.headers.set("Accept", "application/json")
+    return k.handleRequest(r)
+}
+
+test "matching: literal paths, parameters, constraints, optional and rest, backtracking" {
+    let r = new Router(new Container())
+    r.get("/", ok("home"))
+    r.get("/users", ok("list"))
+    r.get("/users/new", ok("new form"))                              // a literal wins over {id}
+    r.get("/users/{id:int}", fn(req: Request) -> Response { return echoParams(req) })
+    r.get("/users/{slug:slug}", fn(req: Request) -> Response { return echoParams(req) })
+    r.get("/posts/{page?}", fn(req: Request) -> Response { return echoParams(req) }).defaultValue("page", "1")
+    r.get("/files/{path*}", fn(req: Request) -> Response { return echoParams(req) })
+    r.get("/codes/{code:[A-Z]{3}}", fn(req: Request) -> Response { return echoParams(req) })
+    r.get("/a/{x}/c", ok("axc"))
+    r.get("/a/b/{y}", ok("aby"))                                     // /a/b/c must backtrack to here
+    let k = new HttpKernel(r)
+    assertEq(call(k, "GET", "/").body(), "home")
+    assertEq(call(k, "GET", "/users/").body(), "list")               // trailing slash
+    assertEq(call(k, "GET", "/users/new").body(), "new form")
+    assertEq(call(k, "GET", "/users/42").body(), "id=42")
+    assertEq(call(k, "GET", "/users/ada-lovelace").body(), "slug=ada-lovelace")
+    assertEq(call(k, "GET", "/users/Ada!").statusCode(), 404)
+    assertEq(call(k, "GET", "/posts").body(), "page=1")
+    assertEq(call(k, "GET", "/posts/3").body(), "page=3")
+    assertEq(call(k, "GET", "/files/docs/2026/report.pdf").body(), "path=docs/2026/report.pdf")
+    assertEq(call(k, "GET", "/codes/USD").body(), "code=USD")
+    assertEq(call(k, "GET", "/codes/usd").statusCode(), 404)
+    assertEq(call(k, "GET", "/a/b/c").body(), "aby")                 // a literal segment beats a parameter
+    assertEq(call(k, "GET", "/a/q/c").body(), "axc")
+    assertEq(call(k, "GET", "/nowhere").statusCode(), 404)
+}
+
+test "405 with Allow, automatic OPTIONS, HEAD answered by GET, any(), matching()" {
+    let r = new Router(new Container())
+    r.get("/items/{id}", ok("show"))
+    r.put("/items/{id}", ok("update"))
+    r.post("/items", ok("store"))
+    r.matching(["get", "post"], "/both", ok("both"))
+    r.any("/anything", ok("any"))
+    let k = new HttpKernel(r)
+    let res = call(k, "DELETE", "/items/1")
+    assertEq("${res.statusCode()} ${res.getHeader("Allow")}", "405 GET, HEAD, PUT")
+    let opt = call(k, "OPTIONS", "/items/1")
+    assertEq("${opt.statusCode()} ${opt.getHeader("Allow")}", "204 GET, HEAD, PUT")
+    assertEq(call(k, "HEAD", "/items/1").statusCode(), 200)
+    assertEq(call(k, "POST", "/both").body(), "both")
+    assertEq(call(k, "PATCH", "/anything").body(), "any")
+    assertEq(call(k, "GET", "/items").statusCode(), 405)
+}
+
+test "groups: prefixes, name prefixes, middleware, patterns; names and URLs" {
+    let r = new Router(new Container())
+    r.aliasMiddleware("tag", fn(args: Array<string>) -> Middleware {
+        let label = args.size() > 0 ? args[0] : "t"
+        return new FnMiddleware(fn(req: Request, next: fn(Request) -> Response) -> Response { return next(req).header("X-Tag-" + label, "1") })
+    })
+    r.prefix("admin").name("admin.").middleware(["tag:admin"]).group(fn(r: Router) {
+        r.get("/", ok("dash")).name("home")
+        r.prefix("users").name("users.").where("id", "int").group(fn(r: Router) {
+            r.get("/{id}", fn(req: Request) -> Response { return echoParams(req) }).name("show").middleware(["tag:inner"])
+            r.get("/{id}/plain", ok("plain")).name("plain").withoutMiddleware(["tag"])
+        })
+    })
+    r.get("/search", ok("s")).name("search")
+    let k = new HttpKernel(r)
+    let res = call(k, "GET", "/admin/users/5")
+    assertEq("${res.body()} ${res.getHeader("X-Tag-admin")} ${res.getHeader("X-Tag-inner")}", "id=5 1 1")
+    assertEq(call(k, "GET", "/admin/users/x").statusCode(), 404)     // the group's pattern
+    assertEq(call(k, "GET", "/admin/users/5/plain").getHeader("X-Tag-admin"), "")
+    assertEq(r.url("admin.home"), "/admin")
+    assertEq(r.url("admin.users.show", {"id": 5 as any, "tab": "posts" as any}), "/admin/users/5?tab=posts")
+    assertEq(r.url("search", {"q": "a b&c" as any}), "/search?q=a%20b%26c")
+    let msg = ""
+    try { r.url("admin.users.show") } catch (e: ValueError) { msg = e.message() }
+    assertEq(msg, "route 'admin.users.show' needs {id}")
+    let named = Request.make("GET", "/admin")
+    k.handleRequest(named)
+    assertEq(named.routeIs(["admin.*"]), true)
+}
+
+test "signed URLs: valid, tampered with, expired" {
+    let r = new Router(new Container())
+    r.signingKey = "secret"
+    r.get("/unsubscribe/{user}", fn(req: Request) -> Response { return Response.text("bye " + req.param("user")) }).name("unsub").signed()
+    let k = new HttpKernel(r)
+    let link = r.signedUrl("unsub", {"user": 7 as any}, Time.now() + 60)
+    assertEq(call(k, "GET", link).body(), "bye 7")
+    assertEq(call(k, "GET", Str.replace(link, "/7?", "/8?")).statusCode(), 403)
+    assertEq(call(k, "GET", "/unsubscribe/7").statusCode(), 403)
+    let stale = r.signedUrl("unsub", {"user": 7 as any}, Time.now() - 1)
+    assertEq(call(k, "GET", stale).statusCode(), 403)
+    assertEq(call(k, "GET", r.signedUrl("unsub", {"user": 7 as any})).statusCode(), 200)   // no expiry
+}
+
+class Post { public id: long  public title: string  constructor(id: long, title: string) { self.id = id; self.title = title } }
+class Slugged implements UrlRoutable { public slug: string  constructor(s: string) { self.slug = s }  fn routeKey() -> string { return self.slug } }
+@Entity class Tracked { public id: long  constructor(id: long) { self.id = id } }
+class PostRepo {
+    public posts: HashMap<string, Post> = new HashMap<string, Post>()
+    constructor() { self.posts.put("1", new Post(1, "Hello")); self.posts.put("2", new Post(2, "Again")) }
+    fn find(id: string) -> Post { return self.posts.getOr(id, null) }
+}
+
+test "route model binding: {post} becomes a Post, or a 404" {
+    let repo = new PostRepo()
+    let r = new Router(new Container())
+    r.bind("post", fn(id: string, req: Request) -> any { return repo.find(id) })
+    r.get("/posts/{post}", fn(req: Request) -> Response { return Response.text((req.get("post") as Post).title) })
+    let k = new HttpKernel(r)
+    assertEq(call(k, "GET", "/posts/2").body(), "Again")
+    assertEq(call(k, "GET", "/posts/9").statusCode(), 404)
+    assertEq(Router.paramText(new Post(5, "x")), "Post")              // no reflection, no key: its text
+    assertEq(Router.paramText(new Slugged("ada")), "ada")            // UrlRoutable
+    assertEq(Router.paramText(new Tracked(9)), "9")                  // reflected: its id field
+}
+
+class Greeting { public word: string = "hello" }
+class PhotoController extends Controller {
+    public greeting: Greeting
+    constructor(greeting: Greeting) { self.greeting = greeting }
+    fn index(req: Request) -> Response { return Response.text("${self.greeting.word} photos") }
+    fn store(req: Request) -> Response { return Response.created({"title": req.text("title") as any}) }
+    fn show(req: Request, photo: string) -> Response { return Response.text("photo " + photo) }
+    fn update(req: Request, photo: string) -> any { return {"updated": photo as any} }
+    fn destroy(req: Request, photo: string) -> any { return null }
+}
+
+test "controllers: built per request with injection; route values after services" {
+    let c = new Container()
+    c.register::<Greeting>()
+    let r = new Router(c)
+    r.get::<PhotoController>("/p/{photo}", "show").name("p.show")
+    let k = new HttpKernel(r)
+    assertEq(call(k, "GET", "/p/9").body(), "photo 9")
+    let routes = r.resource::<PhotoController>("photos")
+    assertEq(routes.size(), 5)                                       // no create/edit methods
+    assertEq(call(k, "GET", "/photos").body(), "hello photos")
+    let made = k.handleRequest(Request.make("POST", "/photos", "{\"title\": \"Sunset\"}", "application/json"))
+    assertEq("${made.statusCode()} ${made.body()}", "201 {\"title\":\"Sunset\"}")
+    assertEq(call(k, "PATCH", "/photos/3").body(), "{\"updated\":\"3\"}")
+    assertEq(call(k, "DELETE", "/photos/3").statusCode(), 204)
+    assertEq(r.url("photos.show", {"photo": 3 as any}), "/photos/3")
+    let api = r.apiResource::<PhotoController>("v1/pics", ["index", "show"])
+    assertEq(api.size(), 2)
+    assertEq(r.has("v1.pics.index"), true)
+}
+
+@Prefix("/orders") @Name("orders.") @Middleware("stamp")
+class OrderController extends Controller {
+    constructor() {}
+    @Get("/") @Name("index")
+    fn index(req: Request) -> Response { return Response.text("orders") }
+    @Get("/{id}") @Name("show") @Where("id", "int")
+    fn show(req: Request, id: string) -> Response { return Response.text("order " + id) }
+    @Route("PUT|PATCH", "/{id}") @WithoutMiddleware("stamp")
+    fn update(req: Request, id: string) -> Response { return Response.text("updated " + id) }
+    fn helper() -> string { return "not a route" }
+}
+
+test "decorator routes on controllers, found by discover()" {
+    let r = new Router(new Container())
+    r.aliasInstance("stamp", new FnMiddleware(fn(req: Request, next: fn(Request) -> Response) -> Response { return next(req).header("X-Stamp", "1") }))
+    assertEq(r.discover() >= 3, true)
+    let k = new HttpKernel(r)
+    assertEq(call(k, "GET", "/orders").getHeader("X-Stamp"), "1")
+    assertEq(call(k, "GET", "/orders/12").body(), "order 12")
+    let other = call(k, "GET", "/orders/x")                         // only the PUT|PATCH route takes it
+    assertEq("${other.statusCode()} ${other.getHeader("Allow")}", "405 PATCH, PUT")
+    let up = call(k, "PATCH", "/orders/4")
+    assertEq("${up.body()} ${up.getHeader("X-Stamp")}", "updated 4 ")
+    assertEq(r.url("orders.show", {"id": 4 as any}), "/orders/4")
+}
+
+test "middleware: global, groups, each once, unknown names are errors" {
+    let r = new Router(new Container())
+    let order = new Array<string>()
+    let mk = fn(label: string) -> Middleware {
+        return new FnMiddleware(fn(req: Request, next: fn(Request) -> Response) -> Response { order.push(label); return next(req) })
+    }
+    r.aliasInstance("a", mk("a"))
+    r.aliasInstance("b", mk("b"))
+    r.aliasInstance("c", mk("c"))
+    r.middlewareGroup("web", ["a", "b"])
+    r.use("c")
+    r.get("/x", ok("x")).middleware(["web", "a"])                    // "a" twice: runs once
+    let k = new HttpKernel(r)
+    call(k, "GET", "/x")
+    assertEq(Str.join(order, ""), "cab")
+    let bad = new Router(new Container())
+    bad.get("/y", ok("y")).middleware(["nope"])
+    let msg = ""
+    try { bad.compile() } catch (e: ValueError) { msg = e.message() }
+    assertEq(Str.startsWith(msg, "unknown middleware 'nope'"), true)
+}
+
+test "throttling: limits, headers, 429 with Retry-After, named limiters" {
+    let limits = new RateLimiter()
+    limits.define("vip", fn(req: Request) -> Limit { return req.query("vip") == "1" ? Limit.none() : Limit.perMinute(1).by("guest") })
+    let r = new Router(new Container())
+    r.aliasMiddleware("throttle", fn(args: Array<string>) -> Middleware { return new ThrottleRequests(limits, args) })
+    r.get("/t", ok("t")).middleware(["throttle:2,1"])
+    r.get("/v", ok("v")).middleware(["throttle:vip"])
+    let k = new HttpKernel(r)
+    assertEq(call(k, "GET", "/t").getHeader("X-RateLimit-Remaining"), "1")
+    assertEq(call(k, "GET", "/t").getHeader("X-RateLimit-Remaining"), "0")
+    let over = call(k, "GET", "/t")
+    assertEq("${over.statusCode()} ${Format.toIntOr(over.getHeader("Retry-After"), -1) > 0}", "429 true")
+    call(k, "GET", "/v")
+    assertEq(call(k, "GET", "/v").statusCode(), 429)
+    assertEq(call(k, "GET", "/v?vip=1").statusCode(), 200)
+}
+
+class PaymentError extends Exception { constructor(m: string) { super(m) } public fn kind() -> string { return "PaymentError" } }
+
+test "the kernel: renderers, reporting, debug pages, the fallback" {
+    let r = new Router(new Container())
+    r.get("/boom", fn(req: Request) -> Response { throw new StateError("kaput") })
+    r.get("/pay", fn(req: Request) -> Response { throw new PaymentError("card declined") })
+    r.get("/teapot", fn(req: Request) -> Response { abort(418, "short and stout") return Response.text("") })
+    let k = new HttpKernel(r)
+    let reported = new Array<string>()
+    k.report(fn(e: Exception, req: Request) { reported.push(e.kind()) })
+    k.renderUsing("PaymentError", fn(e: Exception, req: Request) -> Response { return Response.json({"error": e.message() as any}, 402) })
+    let boom = call(k, "GET", "/boom")
+    assertEq("${boom.statusCode()} ${boom.body()}", "500 {\"message\":\"Server Error\"}")
+    k.debug = true
+    let loud = call(k, "GET", "/boom").data() as HashMap<string, any>
+    assertEq(loud["message"] as string, "StateError: kaput")
+    let pay = call(k, "GET", "/pay")
+    assertEq("${pay.statusCode()} ${pay.body()}", "402 {\"error\":\"card declined\"}")
+    assertEq(call(k, "GET", "/teapot").statusCode(), 418)
+    assertEq(Str.join(reported, ","), "StateError,StateError,PaymentError")    // 4xx HttpExceptions are not reported
+    r.fallback(fn(req: Request) -> Response { return Response.text("custom 404", 404) })
+    assertEq(call(k, "GET", "/missing").body(), "custom 404")
+}
+
+test "serving: a real request through the standard library's server" {
+    let r = new Router(new Container())
+    r.get("/hello/{name}", fn(req: Request) -> Response { return Response.json({"hi": req.param("name") as any}) })
+    let server = new HttpKernel(r).start(0)
+    let res = HttpClient.fetch(server.baseUrl() + "/hello/ada")
+    assertEq("${res.status} ${res.body()}", "200 {\"hi\":\"ada\"}")
+    server.stop()
+}
