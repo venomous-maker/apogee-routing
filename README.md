@@ -31,10 +31,11 @@ kernel.serve(8080)
 handler is `fn(Request) -> Response`, or a controller action:
 `get::<C>(uri, "method")`.
 
-Patterns: `{id}`, `{id:int}` (shorthands `int`, `alpha`, `alnum`, `slug`,
+Patterns: `{id}`, `{id:int}` (shorthands `int`, `number`, `alpha`, `alnum`,
 `uuid`, `ulid`, `hex`, or a regular expression: `{code:[A-Z]{3}}`),
+`{post:slug}` (a binding key),
 `{page?}` (optional, with `defaultValue`), `{path*}` (the rest of the path).
-On a route: `.where(param, pattern)`, `whereNumber`, `whereAlpha`,
+On a route: `.where(param, pattern)` (also `"slug"`), `whereNumber`, `whereAlpha`,
 `whereUuid`, `whereIn(param, values)`, `.name()`, `.middleware()`,
 `.withoutMiddleware()`, `.signed()`. `router.pattern(param, pattern)`
 applies to every route.
@@ -84,6 +85,34 @@ class OrderController extends Controller {
 }
 r.discover()      // every Controller subclass: they all have reflection through Controller's decorator
 ```
+
+## Route model binding
+
+```grav
+// Implicit: a controller parameter whose class has a static
+// resolveRouteBinding(value, field) gets the model for its route value.
+@Model class Post {
+    static fn resolveRouteBinding(value: string, field: string) -> any { return Post.findBy(field == "" ? "id" : field, value) }
+    fn resolveChildRouteBinding(child: string, value: string, field: string) -> any { return self.comments().find(value) }
+}
+r.get::<PostController>("/posts/{post}", "show")             // fn show(post: Post) -> Response
+r.get::<PostController>("/p/{post:slug}", "show")            // found by its slug field
+r.get::<PostController>("/posts/{post}/comments/{comment}", "comment").scopeBindings()   // the post's own comment
+r.get::<PostController>("/posts/{post}", "show").missing(fn(req: Request) -> Response { return Response.redirect("/posts") })
+
+// Explicit, for closures too (req.route("post") is the model):
+r.bind("post", fn(id: string, req: Request) -> any { return Post.find(id) })
+r.bindKeyed("post", fn(value: string, key: string, req: Request) -> any { ... })          // {post:slug}: key "slug"
+r.bindChild("comment", fn(value: string, key: string, parent: any, req: Request) -> any { ... })
+r.scopeBindings().group(fn(r: Router) { ... })
+```
+
+A binding that finds nothing is a 404, or the route's `missing()`
+response. Bound models are injected into controller actions by type, and
+`req.route(name)` / `req.get(name)` gives them to closures. In a pattern,
+`{name:word}` is a binding key unless `word` is a constraint shorthand
+(`int`, `number`, `alpha`, `alnum`, `uuid`, `ulid`, `hex`, `any`) or a
+regular expression.
 
 ## URLs
 
