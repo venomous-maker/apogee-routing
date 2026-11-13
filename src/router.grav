@@ -93,6 +93,11 @@ namespace apogee {
             self.fallbackRoute = null;
             self.ready = new AtomicInt(0);
             self.lock = new Mutex();
+            // Form requests (anything ValidatesWhenResolved) validate as the container makes them,
+            // so a controller action that takes one only runs with valid input.
+            if (container != null) {
+                container.afterResolvingAny::<ValidatesWhenResolved>(fn(v: ValidatesWhenResolved, c: Container) { v.validateResolved(); });
+            }
         }
 
         // ── routes ─────────────────────────────────────────────────────────────
