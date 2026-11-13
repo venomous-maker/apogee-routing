@@ -1,0 +1,86 @@
+// controller.grav — Controller: the base class for controllers, and routes
+// declared on them with decorators, found by Router.discover().
+//
+//   @Prefix("/users") @Name("users.") @Middleware("auth")
+//   class UserController extends Controller {
+//       private users: UserRepository
+//       constructor(users: UserRepository) { self.users = users }   // injected
+//
+//       @Get("/") @Name("index")
+//       fn index(req: Request) -> Response { ... }
+//
+//       @Get("/{id:int}") @Name("show")
+//       fn show(req: Request, id: string) -> Response { ... }         // route values after the services
+//
+//       @Post("/") @Middleware("throttle:10,1")
+//       fn store(req: Request) -> Response { ... }
+//   }
+//   router.discover()          // every Controller subclass's decorated methods
+//
+// Method decorators: @Get/@Post/@Put/@Patch/@Delete/@Options/@Any(uri),
+// @Route("GET|POST", uri), @Name(name), @Middleware(name) (repeatable),
+// @WithoutMiddleware(name), @Where(param, pattern), @Signed. Class
+// decorators: @Prefix(uri), @Name(prefix), @Middleware(name) (repeatable).
+import "std"
+import "apogee-http"
+import "router.grav"
+import "route.grav"
+
+namespace apogee {
+
+    // Every controller extends it; its decorator gives every subclass
+    // reflection (so actions can be called by name and discovered).
+    @Controller abstract class Controller { }
+
+    class RouteDiscovery {
+        // Registers every concrete Controller subclass's decorated actions on
+        // `router`; how many routes it added.
+        static fn discover(router: Router) -> int {
+            let n = 0;
+            for (cls in ClassInfo.all(reflect(Controller))) {
+                if (cls.constructors().size() == 0) { continue; }             // abstract
+                n += RouteDiscovery.register(router, cls);
+            }
+            return n;
+        }
+        static fn register(router: Router, cls: ClassInfo) -> int {
+            let prefix = "";
+            let namePrefix = "";
+            let classMiddleware = new Array<string>();
+            for (d in cls.decorators()) {
+                if (d.name == "Prefix") { prefix = d.text(0); }
+                else if (d.name == "Name") { namePrefix = d.text(0); }
+                else if (d.name == "Middleware") { for (a in d.args) { classMiddleware.push("${a}"); } }
+            }
+            let added = 0;
+            for (m in cls.methods()) {
+                let methods = new Array<string>();
+                let uri = "";
+                for (d in m.decorators) {
+                    switch (d.name) {
+                        case "Get", "Post", "Put", "Patch", "Delete", "Options": { methods.push(Str.upper(d.name)); uri = d.text(0); }
+                        case "Any": { methods.push("*"); uri = d.text(0); }
+                        case "Route": { for (x in Str.split(d.text(0), "|")) { methods.push(Str.upper(Str.trim(x))); } uri = d.text(1); }
+                        default: {}
+                    }
+                }
+                if (methods.size() == 0) { continue; }
+                let full = RouteDef.normalize(prefix + "/" + uri);
+                let r = router.matching(methods, full, router.controllerNamed(cls.name, m.name)).describe(cls.name + "@" + m.name);
+                if (classMiddleware.size() > 0) { r.middleware(classMiddleware); }
+                for (d in m.decorators) {
+                    switch (d.name) {
+                        case "Name": r.name(namePrefix + d.text(0))
+                        case "Middleware": { let ms = new Array<string>(); for (a in d.args) { ms.push("${a}"); } r.middleware(ms); }
+                        case "WithoutMiddleware": { let ms = new Array<string>(); for (a in d.args) { ms.push("${a}"); } r.withoutMiddleware(ms); }
+                        case "Where": r.where(d.text(0), d.text(1))
+                        case "Signed": r.signed()
+                        default: {}
+                    }
+                }
+                added += 1;
+            }
+            return added;
+        }
+    }
+}
