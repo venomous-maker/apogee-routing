@@ -1,10 +1,13 @@
 // route.grav — RouteDef: one route as registered (methods, URI pattern,
 // handler, name, middleware, constraints), parsed into segments once.
 //
-// URI patterns: "/users/{id}", "{id:int}" (or .whereNumber("id")), "{slug:slug}",
+// URI patterns: "/users/{id}", "{id:int}" (or .whereNumber("id")),
 // "{code:[A-Z]{3}}" (a regular expression), "{page?}" (optional: the route
-// also answers without it), "{path*}" (the rest of the path, slashes included).
-// Constraint shorthands: int, alpha, alnum, slug, uuid, ulid, hex, any.
+// also answers without it), "{path*}" (the rest of the path, slashes included),
+// "{post:slug}" (a bound model found by its `slug` field, as in Laravel).
+// Inline constraint shorthands: int, number, alpha, alnum, uuid, ulid, hex,
+// any; any other plain word after ":" is a binding key. (.where(p, "slug")
+// constrains to a slug.)
 import "std"
 import "apogee-http"
 import "router.grav"
@@ -99,6 +102,12 @@ namespace apogee {
         public owner: Router
         // A signed URL is required ("signed" middleware, on by .signed()).
         public mustBeSigned: bool
+        // {post:slug}: the field each bound parameter is found by.
+        public bindingKeys: HashMap<string, string>
+        // Resolve each bound parameter through the one before it (a user's own post).
+        public scoped: bool
+        // What answers when a bound parameter finds nothing (else a 404).
+        public missingHandler: fn(Request) -> Response
 
         constructor(methods: Array<string>, uri: string, handler: fn(Request) -> Response, owner: Router) {
             self.methods = methods;
@@ -113,7 +122,10 @@ namespace apogee {
             self.compiled = null;
             self.owner = owner;
             self.mustBeSigned = false;
-            self.segments = RouteDef.parse(self.uri, self.constraints);
+            self.bindingKeys = new HashMap<string, string>();
+            self.scoped = false;
+            self.missingHandler = null;
+            self.segments = RouteDef.parse(self.uri, self.constraints, self.bindingKeys);
         }
 
         // ── fluent configuration ───────────────────────────────────────────────
@@ -132,6 +144,12 @@ namespace apogee {
         // Only a valid signed URL may reach it (see Router.signedUrl).
         fn signed() -> RouteDef { self.mustBeSigned = true; self.owner.dirty(); return self; }
         fn describe(text: string) -> RouteDef { self.action = text; return self; }
+        // Each bound parameter is found through the one before it: in
+        // /users/{user}/posts/{post}, only the user's own post.
+        fn scopeBindings() -> RouteDef { self.scoped = true; return self; }
+        fn withoutScopedBindings() -> RouteDef { self.scoped = false; return self; }
+        // `h` answers (a redirect, say) when a bound parameter finds nothing.
+        fn missing(h: fn(Request) -> Response) -> RouteDef { self.missingHandler = h; return self; }
 
         // Its parameters' names, in order.
         fn paramNames() -> Array<string> {
@@ -141,13 +159,25 @@ namespace apogee {
         }
 
         // ── parsing ────────────────────────────────────────────────────────────
+        // A plain word that is not a constraint shorthand: a binding key ({post:slug}).
+        static fn isBindingKey(p: string) -> bool {
+            switch (p) {
+                case "int", "number", "alpha", "alnum", "uuid", "ulid", "hex", "any": return false
+                default: {}
+            }
+            for (i in 0..p.length) {
+                let c = p[i] as int;
+                if (!((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || (i > 0 && c >= 48 && c <= 57))) { return false; }
+            }
+            return p.length > 0;
+        }
         // "/a//b/" -> "/a/b"; "" -> "/".
         static fn normalize(uri: string) -> string {
             let out = new StringBuilder();
             for (p in Str.split(uri, "/")) { if (p != "") { out.appendChar(47).append(p); } }
             return out.length() == 0 ? "/" : out.toString();
         }
-        static fn parse(uri: string, constraints: HashMap<string, Constraint>) -> Array<Segment> {
+        static fn parse(uri: string, constraints: HashMap<string, Constraint>, keys: HashMap<string, string> = new HashMap<string, string>()) -> Array<Segment> {
             let out = new Array<Segment>();
             for (p in Str.split(uri, "/")) {
                 if (p == "") { continue; }
@@ -164,7 +194,8 @@ namespace apogee {
                 let rest = Str.endsWith(inner, "*");
                 if (optional || rest) { inner = inner[..inner.length - 1]; }
                 if (inner == "") { throw new ValueError("an unnamed route parameter in " + uri); }
-                if (pattern != "") { constraints.put(inner, new Constraint(pattern)); }
+                if (pattern != "" && RouteDef.isBindingKey(pattern)) { keys.put(inner, pattern); }
+                else if (pattern != "") { constraints.put(inner, new Constraint(pattern)); }
                 out.push(new Segment("", inner, optional, rest));
             }
             for (i, s in out) {
