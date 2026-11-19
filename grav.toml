@@ -1,5 +1,6 @@
 name = "apogee-routing"
 lib = "src/all.grav"
+grav = ">=1.7.0"
 paths = ["src"]
 
 [dependencies]
