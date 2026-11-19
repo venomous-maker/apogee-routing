@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.1.0 (2026-11-19)
+
 The first tagged release. Needs grav 1.7.0 or newer.
 
 Routing for [Apogee](https://github.com/venomous-maker): routes, groups, controllers with injection, resource routes, routes declared with decorators, route model binding, URL generation and signed URLs, middleware aliases, groups and parameters, rate limiting, and the HTTP kernel that turns exceptions into responses and serves it all on the standard library's HTTP server.
