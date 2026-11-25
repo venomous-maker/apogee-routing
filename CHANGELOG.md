@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.3.0 (2026-11-25)
+
 - The router tells each request the route it matched (`req.matched`,
   `req.routeUri()`); one `MatchedRoute` per route, shared by its requests.
 
