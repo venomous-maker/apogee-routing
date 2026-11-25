@@ -7,7 +7,7 @@ middleware aliases, groups and parameters, rate limiting, and the HTTP
 kernel that turns exceptions into responses and serves it all on the
 standard library's HTTP server.
 
-```grav
+```typescript
 import "std"
 import "apogee-routing"
 
@@ -47,7 +47,7 @@ other methods is a 405 with `Allow`; `OPTIONS` is answered from the routes;
 
 ## Groups
 
-```grav
+```typescript
 r.prefix("api/v1").name("api.").middleware(["api"]).where("id", "int").group(fn(r: Router) { ... })
 ```
 
@@ -56,7 +56,7 @@ Groups nest: prefixes join, name prefixes join, middleware adds up, and
 
 ## Controllers
 
-```grav
+```typescript
 class PhotoController extends Controller {
     private photos: PhotoRepository
     constructor(photos: PhotoRepository) { self.photos = photos }          // injected
@@ -75,7 +75,7 @@ null as 204, anything else as JSON.
 
 ### Routes declared with decorators
 
-```grav
+```typescript
 @Prefix("/orders") @Name("orders.") @Middleware("auth")
 class OrderController extends Controller {
     @Get("/{id}") @Name("show") @Where("id", "int")
@@ -88,7 +88,7 @@ r.discover()      // every Controller subclass: they all have reflection through
 
 ## Route model binding
 
-```grav
+```typescript
 // Implicit: a controller parameter whose class has a static
 // resolveRouteBinding(value, field) gets the model for its route value.
 @Model class Post {
@@ -116,7 +116,7 @@ regular expression.
 
 ## URLs
 
-```grav
+```typescript
 r.url("users.show", {"id": 7, "tab": "posts"})        // "/users/7?tab=posts"
 r.url("posts.show", {"post": post})                    // a model: its routeKey() (UrlRoutable) or id
 r.signedUrl("unsubscribe", {"user": 7}, Time.now() + 3600)
@@ -128,7 +128,7 @@ compared in constant time, and may expire.
 
 ## Middleware
 
-```grav
+```typescript
 r.aliasMiddleware("throttle", fn(args: Array<string>) -> Middleware { return new ThrottleRequests(limits, args) })
 r.aliasInstance("auth", new Authenticate(guard))
 r.middlewareGroup("web", ["session", "csrf"])
@@ -146,7 +146,7 @@ function when routes are compiled: a request runs through plain calls.
 `"throttle:60,1"` is 60 a minute per IP, and `"throttle:api"` uses a named
 limiter, chosen per request:
 
-```grav
+```typescript
 limits.define("api", fn(req: Request) -> Limit {
     return req.user != null ? Limit.perMinute(600).by("user:${userId(req)}") : Limit.perMinute(60)
 })
