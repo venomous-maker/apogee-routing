@@ -9,6 +9,10 @@ compiler versions it builds with.
 - The router tells each request the route it matched (`req.matched`,
   `req.routeUri()`); one `MatchedRoute` per route, shared by its requests.
 
+### Dependencies
+
+- Uses apogee-http 0.3.0 (from their GitHub tags).
+
 ## 0.2.0 (2026-11-20)
 
 ### Requirements
