@@ -547,6 +547,7 @@ namespace apogee {
         }
         private fn run(r: RouteDef, req: Request, m: RouteMatch) -> Response {
             req.routeName = r.routeName;
+            req.matched = r.matched();
             if (r.bindingKeys.size() > 0 || r.missingHandler != null || r.scoped) { req.set("apogee.route", r); }   // (for controllers' implicit binding)
             if (m != null) {
                 for (i, n in m.names) { req.http.setParam(n, m.values[i]); }

@@ -109,6 +109,14 @@ namespace apogee {
         // What answers when a bound parameter finds nothing (else a 404).
         public missingHandler: fn(Request) -> Response
 
+        // (what a request is told it matched: made once, shared)
+        private matchedInfo: MatchedRoute = null
+        fn matched() -> MatchedRoute {
+            if (self.matchedInfo == null) {
+                self.matchedInfo = new MatchedRoute(self.uri, self.routeName, self.methods, self.action, self.middlewareNames);
+            }
+            return self.matchedInfo;
+        }
         constructor(methods: Array<string>, uri: string, handler: fn(Request) -> Response, owner: Router) {
             self.methods = methods;
             self.uri = RouteDef.normalize(uri);
