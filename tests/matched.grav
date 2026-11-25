@@ -1,0 +1,33 @@
+// The matched route on the request: its pattern, name, methods, action and middleware.
+import "std"
+import "std/net"
+import "apogee-container"
+import "apogee-http"
+import "../src/all.grav"
+use apogee.*
+
+class Stamp implements Middleware {
+    constructor() {}
+    fn handle(req: Request, next: fn(Request) -> Response) -> Response { return next(req) }
+}
+
+test "the request knows the route it matched" {
+    let r = new Router(new Container())
+    r.aliasInstance("stamp", new Stamp())
+    let seen = new Array<string>()
+    r.get("/users/{id}", fn(req: Request) -> Response {
+        seen.push(req.routeUri())
+        seen.push(req.matched.name)
+        seen.push(Str.join(req.matched.methods, "|"))
+        seen.push(Str.join(req.matched.middleware, ","))
+        seen.push(str(req.route("id")))
+        seen.push(str(req.matched))
+        return Response.text("ok")
+    }).name("users.show").middleware(["stamp"])
+    let res = r.dispatch(Request.make("GET", "/users/42", "", ""))
+    assertEq(res.body(), "ok")
+    assertEq(str(seen), "[\"/users/{id}\", \"users.show\", \"GET\", \"stamp\", \"42\", \"GET /users/{id} (users.show)\"]")
+    let before = Request.make("GET", "/nowhere", "", "")
+    assertEq(before.routeUri(), "")
+    assertEq(before.matched, null)
+}
