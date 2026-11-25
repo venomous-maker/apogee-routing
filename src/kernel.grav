@@ -79,7 +79,7 @@ namespace apogee {
             if (status >= 500 || !self.dontReport.contains(e.kind())) { self.tell(e, req); }
         }
         private fn tell(e: Exception, req: Request) {
-            for (f in self.reporters) { try { f(e, req); } catch (x: Exception) {} }
+            for (f in self.reporters) { try { f(e, req); } catch (x: Exception) {} }   // (a reporter that fails must not hide the error it reports)
         }
 
         // ── serving ────────────────────────────────────────────────────────────
